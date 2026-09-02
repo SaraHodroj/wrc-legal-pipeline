@@ -1,12 +1,12 @@
 # WRC Legal Document Pipeline
 
 A partitioned, idempotent scraping pipeline that ingests decisions and
-determinations from the Irish [Workplace Relations
+determinations from the [Workplace Relations
 Commission](https://www.workplacerelations.ie/en/cases/) into a landing zone,
-then transforms them into a curated zone.
+then transforms them into a curated zone (using 2 stages)
 
 Built with **Scrapy** (crawling), **MongoDB** (metadata), **MinIO/S3** (objects)
-and **Dagster** (orchestration).
+and **Dagster** (orchestration)
 
 ---
 
