@@ -215,5 +215,4 @@ build on Python 3.11 and 3.12 for every push.
 - **Access should be legitimate.** The crawler identifies itself with a contact
   address and obeys `robots.txt`. For sustained bulk ingestion of a legal
   corpus, the durable path is an agreement with the source rather than
-  engineering around access controls — a corpus whose provenance cannot
-  withstand a client's due diligence is not an asset.
+  engineering around access controls
