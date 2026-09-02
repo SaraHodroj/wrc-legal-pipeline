@@ -261,3 +261,97 @@ def test_async_start_yields_the_same_requests_as_start_requests(spider):
 
     requests = asyncio.run(collect())
     assert [r.url for r in requests] == [r.url for r in spider.start_requests()]
+
+
+# --------------------------------------------------------------------------
+# Regressions caught by the first live run against workplacerelations.ie.
+# --------------------------------------------------------------------------
+DETAIL_WITH_COOKIE_BANNER = """
+<html><body>
+  <div class="consent">
+    Our website uses cookies.
+    <a href="/en/privacy-policy/cookie_policy.pdf">Cookie Policy</a>
+  </div>
+  <main id="main">
+    <h1>ADJ-00054658</h1>
+    <p>ADJUDICATION OFFICER Decision. The complaint is well founded.</p>
+  </main>
+</body></html>
+"""
+
+
+def test_cookie_policy_pdf_is_not_mistaken_for_the_decision(spider):
+    """Live-run regression: every WRC detail page links cookie_policy.pdf from
+    its consent banner; a naive first-PDF-link selector sent every record
+    there (a 404) and the smoke test stored nothing."""
+    resp = response(
+        "https://example.ie/en/cases/2025/july/adj-00054658.html", DETAIL_WITH_COOKIE_BANNER
+    )
+    results = list(spider.parse_detail(resp, ROW, "Workplace Relations Commission", PARTITION))
+
+    # No request chased the cookie PDF; the page itself became the record.
+    assert all(not isinstance(r, type(resp.request)) or "cookie" not in r.url for r in results)
+    stores = [r for r in results if isinstance(r, dict) and r.get("__action__") == "store"]
+    assert len(stores) == 1
+    assert stores[0]["record"].document_type == "html"
+
+
+def test_real_document_link_still_wins_over_the_html_page(spider):
+    banner_plus_doc = DETAIL_WITH_COOKIE_BANNER.replace(
+        "</main>", '<a href="/en/docs/adj-00054658.pdf">Download decision</a></main>'
+    )
+    resp = response(
+        "https://example.ie/en/cases/2025/july/adj-00054658.html", banner_plus_doc
+    )
+    results = list(spider.parse_detail(resp, ROW, "Workplace Relations Commission", PARTITION))
+
+    assert len(results) == 1
+    assert results[0].url.endswith("/en/docs/adj-00054658.pdf")
+
+
+PAGE_ONE_OF_MANY = """
+<html><body>
+  <p>Shows 1 to 1 of 30 results</p>
+  <div>
+    <div><h3>ADJ-00054658</h3><span>17/07/2025</span></div>
+    <div>Ref no: ADJ-00054658
+      <a href="/en/cases/2025/july/adj-00054658.html">View Page</a></div>
+  </div>
+</body></html>
+"""
+
+
+def test_pagination_falls_back_to_a_constructed_url(spider):
+    """Live-run regression: the site reported 234 results but rendered no
+    next-page link our matcher recognised, so the crawl silently stopped at
+    page 1. When the counter says more records exist, the spider must
+    construct the next page's URL itself."""
+    resp = response("https://example.ie/en/search/?decisions=1", PAGE_ONE_OF_MANY)
+    requests = list(spider.parse_search(resp, "Workplace Relations Commission", PARTITION, 1))
+
+    page_two = [r for r in requests if "page=2" in r.url]
+    assert len(page_two) == 1
+    assert page_two[0].cb_kwargs["page"] == 2
+
+
+def test_constructed_pagination_stops_when_a_page_repeats(spider):
+    """The safety net for the fallback: if page 2 re-serves page 1's rows
+    (i.e. our page parameter guess was wrong), pagination must stop instead
+    of looping to page 500."""
+    resp1 = response("https://example.ie/en/search/?decisions=1", PAGE_ONE_OF_MANY)
+    list(spider.parse_search(resp1, "Workplace Relations Commission", PARTITION, 1))
+
+    resp2 = response("https://example.ie/en/search/?decisions=1&page=2", PAGE_ONE_OF_MANY)
+    requests = list(spider.parse_search(resp2, "Workplace Relations Commission", PARTITION, 2))
+    assert requests == []
+
+
+def test_relative_next_page_hrefs_are_recognised(spider):
+    """A pager that emits `?page=2` (no path) must still be followed."""
+    paged = PAGE_ONE_OF_MANY.replace(
+        "</body>", '<a href="?decisions=1&amp;page=2">2</a></body>'
+    )
+    resp = response("https://example.ie/en/search/?decisions=1", paged)
+    requests = list(spider.parse_search(resp, "Workplace Relations Commission", PARTITION, 1))
+    page_two = [r for r in requests if "page=2" in r.url and r.cb_kwargs.get("page") == 2]
+    assert len(page_two) == 1

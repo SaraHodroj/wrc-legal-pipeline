@@ -21,6 +21,7 @@ offline / blocked); the output says which assumption broke.
 
 from __future__ import annotations
 
+import ssl
 import sys
 import urllib.robotparser
 from datetime import date
@@ -32,6 +33,22 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from wrc_pipeline.config import get_settings  # noqa: E402
 from wrc_pipeline.scraping.search_adapter import WrcSearchAdapter  # noqa: E402
 
+# macOS python.org installs ship without system CA certificates wired up, so a
+# bare urlopen dies with CERTIFICATE_VERIFY_FAILED. Prefer certifi's bundle
+# when available (it ships with this project's dependencies); otherwise fall
+# back to the system default and, if that fails too, tell the user the fix.
+try:
+    import certifi
+
+    SSL_CONTEXT = ssl.create_default_context(cafile=certifi.where())
+except ImportError:  # pragma: no cover
+    SSL_CONTEXT = ssl.create_default_context()
+
+CERT_HINT = (
+    "hint: on macOS run 'open \"/Applications/Python 3.13/Install "
+    "Certificates.command\"' (adjust the version) or 'pip install certifi'."
+)
+
 # A window known to be busy: January 2024, Workplace Relations Commission.
 BODY = "Workplace Relations Commission"
 START, END = date(2024, 1, 1), date(2024, 1, 31)
@@ -40,10 +57,15 @@ SAMPLE_DETAIL_PATH = "/en/cases/2024/january/adj-00045701.html"
 
 def fetch(url: str, user_agent: str) -> str:
     request = Request(url, headers={"User-Agent": user_agent})
-    with urlopen(request, timeout=30) as response:  # noqa: S310 - fixed https host
-        if response.status != 200:
-            raise RuntimeError(f"HTTP {response.status} for {url}")
-        return response.read().decode("utf-8", errors="replace")
+    try:
+        with urlopen(request, timeout=30, context=SSL_CONTEXT) as response:  # noqa: S310
+            if response.status != 200:
+                raise RuntimeError(f"HTTP {response.status} for {url}")
+            return response.read().decode("utf-8", errors="replace")
+    except OSError as exc:  # URLError subclasses OSError; SSL errors hide inside
+        if "CERTIFICATE_VERIFY_FAILED" in str(exc):
+            raise RuntimeError(f"{exc} -- {CERT_HINT}") from exc
+        raise
 
 
 def main() -> int:

@@ -77,6 +77,9 @@ class DecisionsSpider(scrapy.Spider):
         self.adapter = WrcSearchAdapter(base_url=settings.scrape.base_url)
         self.stats_model = RunStats(run_id=self.run_id)
         self.known_hashes: dict[tuple[str, str], str | None] = {}
+        # Detail URLs already yielded, per (body, partition key) -- the guard
+        # that makes the pagination fallback in parse_search self-limiting.
+        self._seen_detail_urls: dict[tuple[str, str], set[str]] = {}
         self._partitions: list[Partition] = list(
             iter_partitions(self.start_date, self.end_date, self.partition_size)  # type: ignore[arg-type]
         )
@@ -168,11 +171,23 @@ class DecisionsSpider(scrapy.Spider):
             )
             return
 
+        # Track which detail URLs this (body, partition) has already produced.
+        # This is what makes the constructed-URL pagination fallback below
+        # safe: a wrong page parameter just re-serves page 1, yields zero new
+        # rows, and pagination stops after one wasted request instead of
+        # looping or double-counting.
+        seen = self._seen_detail_urls.setdefault((body_name, partition.key), set())
+        new_rows = [row for row in rows if row.detail_url not in seen]
+        seen.update(row.detail_url for row in rows)
+
+        if page > 1 and not new_rows:
+            return  # the site re-served content we already have -- end of pages
+
         cap = self.settings_obj.scrape.max_records_per_partition
         if cap:
-            rows = rows[:cap]
+            new_rows = new_rows[: max(0, cap - (len(seen) - len(new_rows)))]
 
-        for row in rows:
+        for row in new_rows:
             self.stats_model.records_found += 1
             yield scrapy.Request(
                 url=row.detail_url,
@@ -182,11 +197,35 @@ class DecisionsSpider(scrapy.Spider):
                 meta={"partition_key": partition.key, "body_name": body_name},
             )
 
-        # Follow the next-page link the site itself renders -- never a URL we
-        # construct. Cap the depth as a circuit breaker against a site that
-        # links page N+1 forever.
+        if cap and len(seen) >= cap:
+            return  # smoke-test cap reached; no point fetching further pages
+
+        # Pagination, two strategies in order of trust. First, follow the
+        # next-page link the site itself renders. If no link is recognised but
+        # the results counter says more records exist than we have seen, fall
+        # back to constructing the next page's URL -- the seen-set above turns
+        # a wrong construction into a no-op rather than an infinite loop.
+        # Page depth is capped as a circuit breaker either way.
+        if page >= 500:
+            return
         next_url = self.adapter.next_page_url(response.text, response.url, page)
-        if next_url and page < 500:
+        if not next_url and total and len(seen) < total and new_rows:
+            next_url = self.adapter.build_search_url(
+                body_name, partition.start, partition.end, page + 1
+            )
+            logger.info(
+                "No next-page link recognised; falling back to constructed URL",
+                extra={
+                    "event": "pagination_fallback",
+                    "run_id": self.run_id,
+                    "partition": partition.key,
+                    "body": body_name,
+                    "page": page + 1,
+                    "seen": len(seen),
+                    "total_reported": total,
+                },
+            )
+        if next_url:
             yield scrapy.Request(
                 url=next_url,
                 callback=self.parse_search,
@@ -213,10 +252,7 @@ class DecisionsSpider(scrapy.Spider):
         if doc_type is DocumentType.HTML or doc_type is DocumentType.UNKNOWN:
             # The detail page may itself embed a link to a PDF. If so, follow
             # it -- the primary document beats the HTML wrapper around it.
-            document_href = response.css(
-                "a[href$='.pdf']::attr(href), a[href$='.doc']::attr(href), "
-                "a[href$='.docx']::attr(href)"
-            ).get()
+            document_href = self._document_link(response)
             if document_href:
                 yield response.follow(
                     document_href,
@@ -383,6 +419,34 @@ class DecisionsSpider(scrapy.Spider):
         self._store.close()
 
     # ----------------------------------------------------------------- helpers
+    #: Link-target fragments that mark site furniture, never the decision
+    #: document. Learned from a live run: every WRC detail page links the
+    #: cookie-policy PDF from its consent banner, and a naive "first PDF link
+    #: on the page" selector routed all ten records of the smoke test to
+    #: /en/privacy-policy/cookie_policy.pdf (a 404) instead of the decision.
+    CHROME_LINK_FRAGMENTS = ("cookie", "privacy-policy", "privacy_policy")
+
+    _DOC_LINK_CSS = (
+        "a[href$='.pdf']::attr(href), a[href$='.doc']::attr(href), "
+        "a[href$='.docx']::attr(href)"
+    )
+
+    @classmethod
+    def _document_link(cls, response: Response) -> str | None:
+        """First document link that plausibly IS the decision.
+
+        Prefer links inside the main content container (the page chrome lives
+        outside it), fall back to the whole page for legacy markup, and in
+        both cases refuse links that are clearly site furniture.
+        """
+        main = response.css("main")
+        candidates: list[str] = list(main.css(cls._DOC_LINK_CSS).getall()) if main else []
+        candidates += response.css(cls._DOC_LINK_CSS).getall()
+        for href in candidates:
+            if not any(frag in href.lower() for frag in cls.CHROME_LINK_FRAGMENTS):
+                return str(href)
+        return None
+
     @staticmethod
     def _extract_title(response: Response) -> str | None:
         for css in ("h1::text", "h2::text", "title::text"):

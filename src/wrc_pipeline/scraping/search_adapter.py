@@ -216,25 +216,34 @@ class WrcSearchAdapter:
         return int(match.group(1).replace(",", ""))
 
     def next_page_url(self, html: str, base_url: str, current_page: int) -> str | None:
-        """Return the next page's URL exactly as the site advertises it.
+        """Return the next page's URL as the site advertises it, if we can.
 
-        We deliberately do not construct page URLs ourselves: the page
-        parameter's name was never confirmed against the live site, and a
-        wrong guess would silently truncate every partition to one page.
-        Following the link the site itself renders removes the guess entirely
-        -- if there is no next-page link, there is no next page.
+        We prefer the link the site itself renders over constructing one:
+        following real markup can't guess a parameter name wrong. Anchors are
+        resolved against the page URL *before* matching, because a pager
+        typically emits relative hrefs (``?page=2``) that carry no path at
+        all -- matching on the raw href would miss every one of them.
+
+        The spider holds the safety net: when no link is recognised here but
+        the results counter says more records exist, it constructs the next
+        URL itself and relies on its seen-set to stop if that guess re-serves
+        the same page.
         """
         selector = Selector(text=html)
-        next_labels = {"next", "\u00bb", "\u203a", "next page", ">"}
+        next_labels = {"next", "\u00bb", "\u203a", "next page", ">", ">>"}
         numeric_target = str(current_page + 1)
 
-        for anchor in selector.xpath('//a[contains(@href, "/en/search")]'):
+        for anchor in selector.xpath("//a[@href]"):
             href = (anchor.attrib.get("href") or "").strip()
-            if not href:
+            if not href or href.startswith(("#", "javascript:", "mailto:")):
                 continue
+            resolved = urljoin(base_url, href)
+            if "/en/search" not in resolved:
+                continue
+            rel = (anchor.attrib.get("rel") or "").strip().lower()
             label = " ".join(anchor.xpath(".//text()").getall()).strip().lower()
-            if label in next_labels or label == numeric_target:
-                return urljoin(base_url, href)
+            if rel == "next" or label in next_labels or label == numeric_target:
+                return resolved
         return None
 
     # --------------------------------------------------------------- helpers

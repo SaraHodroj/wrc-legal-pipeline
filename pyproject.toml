@@ -31,6 +31,7 @@ dev = [
     "pytest-cov>=5.0",
     "mongomock>=4.1",
     "moto[s3]>=5.0",
+    "certifi>=2024.2",
     "ruff>=0.5",
     # mypy 2.x currently hard-crashes (internal error) on this codebase;
     # pin to the 1.x series until that stabilises.

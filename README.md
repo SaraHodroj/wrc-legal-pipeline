@@ -24,7 +24,7 @@ python -m venv .venv && source .venv/bin/activate
 make install     # pip install -e ".[dev]"
 
 # 4. Verify offline
-make test        # 103 tests, no infrastructure required
+make test        # 108 tests, no infrastructure required
 
 # 5. Verify the live site still matches the adapter (2 polite GETs, no infra)
 make check-site  # or: python scripts/check_site_contract.py
@@ -179,7 +179,7 @@ comparison before every write, and deterministic object keys. See
 ## Testing
 
 ```bash
-make test    # 103 tests across every module: partitioning boundaries, hashing,
+make test    # 108 tests across every module: partitioning boundaries, hashing,
              # HTML extraction, idempotency, search-adapter parsing, spider
              # callbacks, persistence pipeline, transform job, logging, CLI,
              # and a Dagster definitions smoke test. ~83% line coverage.
