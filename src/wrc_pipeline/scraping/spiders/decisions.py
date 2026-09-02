@@ -249,6 +249,10 @@ class DecisionsSpider(scrapy.Spider):
         """
         content_type = _header(response, "Content-Type")
         doc_type = DocumentType.from_url_or_content_type(response.url, content_type)
+        # The listing row's description is sometimes blank on the live site;
+        # the detail page's meta description reliably carries the parties
+        # ("A v B"), so backfill from there rather than storing null metadata.
+        description = row.description or self._extract_meta_description(response)
 
         if doc_type is DocumentType.HTML or doc_type is DocumentType.UNKNOWN:
             # The detail page may itself embed a link to a PDF. If so, follow
@@ -265,6 +269,7 @@ class DecisionsSpider(scrapy.Spider):
                         "partition": partition,
                         "source_url": response.url,
                         "title": self._extract_title(response),
+                        "description": description,
                     },
                     meta={"partition_key": partition.key, "body_name": body_name},
                     # Document requests are already keyed one-per-record by the
@@ -285,6 +290,7 @@ class DecisionsSpider(scrapy.Spider):
             doc_type=DocumentType.HTML if doc_type is DocumentType.UNKNOWN else doc_type,
             content_type=content_type,
             title=self._extract_title(response),
+            description=description,
         )
 
     def parse_document(
@@ -295,6 +301,7 @@ class DecisionsSpider(scrapy.Spider):
         partition: Partition,
         source_url: str,
         title: str | None,
+        description: str | None = None,
     ) -> Iterator[dict[str, Any]]:
         content_type = _header(response, "Content-Type")
         yield from self._emit(
@@ -307,6 +314,7 @@ class DecisionsSpider(scrapy.Spider):
             doc_type=DocumentType.from_url_or_content_type(response.url, content_type),
             content_type=content_type,
             title=title,
+            description=description,
         )
 
     # -------------------------------------------------------------- emit / skip
@@ -321,6 +329,7 @@ class DecisionsSpider(scrapy.Spider):
         doc_type: DocumentType,
         content_type: str | None,
         title: str | None,
+        description: str | None = None,
     ) -> Iterator[dict[str, Any]]:
         """Hash, compare against known state, and emit only if work is needed.
 
@@ -338,7 +347,7 @@ class DecisionsSpider(scrapy.Spider):
             identifier=row.identifier,
             body=body_name,
             title=title,
-            description=row.description,
+            description=description or row.description,
             published_date=row.published_date,
             source_url=source_url,
             document_url=document_url,
@@ -449,6 +458,18 @@ class DecisionsSpider(scrapy.Spider):
         for href in response.css(cls._DOC_LINK_CSS).getall():
             if slug in re.sub(r"[^a-z0-9]", "", href.lower()):
                 return str(href)
+        return None
+
+    @staticmethod
+    def _extract_meta_description(response: Response) -> str | None:
+        """The detail page's meta description -- the parties, e.g. 'A v B'."""
+        for css in (
+            'meta[name="description"]::attr(content)',
+            'meta[property="og:description"]::attr(content)',
+        ):
+            value = response.css(css).get()
+            if value and value.strip():
+                return " ".join(value.split())
         return None
 
     @staticmethod

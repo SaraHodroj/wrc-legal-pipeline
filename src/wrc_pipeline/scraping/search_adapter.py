@@ -10,23 +10,22 @@ new adapter against the ``SearchAdapter`` protocol, not editing the spider, the
 pipelines and the storage layer for every jurisdiction.
 
 --------------------------------------------------------------------------
-IMPORTANT -- verify the request shape before running
+The site contract, as confirmed against the live site (2026-09)
 --------------------------------------------------------------------------
-The search results on this site are populated by an XHR call, not by the
-server-rendered HTML at ``/en/cases/``. Fetching that URL returns the page
-chrome and no results, so the selectors below must be confirmed against the
-real request:
+The search is a plain server-rendered GET -- no XHR, no JavaScript required::
 
-1. Open https://www.workplacerelations.ie/en/cases/ with DevTools -> Network,
-   filtered to Fetch/XHR.
-2. Run a search with a Body and a date range set.
-3. Inspect the request that carries the results. Note its method, path, the
-   exact parameter names for body / start date / finish date / page, and
-   whether the response is JSON or an HTML fragment.
-4. Update ``PARAM_MAP``, ``SEARCH_ENDPOINT`` and the selectors below to match.
+    /en/search/?decisions=1&body=<numeric id>&from=D/M/YYYY&to=D/M/YYYY
+    (&pageNumber=N when paginating)
+
+Endpoint, parameter names, numeric body IDs, the unpadded date format and the
+``pageNumber`` pagination parameter were all read off real requests and real
+pager links, not guessed. ``scripts/check_site_contract.py`` re-verifies every
+one of these assumptions against the live site in seconds -- run it before a
+real crawl, and whenever a crawl unexpectedly returns zero rows.
 
 Pinning those details in one small, well-named module -- instead of scattering
-magic strings through the spider -- is what keeps that a five-minute change.
+magic strings through the spider -- is what keeps a site redesign a
+five-minute change.
 """
 
 from __future__ import annotations

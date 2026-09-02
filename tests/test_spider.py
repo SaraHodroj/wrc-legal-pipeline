@@ -355,3 +355,24 @@ def test_relative_next_page_hrefs_are_recognised(spider):
     requests = list(spider.parse_search(resp, "Workplace Relations Commission", PARTITION, 1))
     page_two = [r for r in requests if "page=2" in r.url and r.cb_kwargs.get("page") == 2]
     assert len(page_two) == 1
+
+
+def test_blank_row_description_is_backfilled_from_the_detail_page(spider):
+    """Live-run regression: listing rows sometimes carry no description; the
+    detail page's meta description reliably holds the parties ('A v B')."""
+    from dataclasses import replace
+
+    page = DETAIL_SELF_CONTAINED.replace(
+        "<html><body>",
+        '<html><head><meta name="description" '
+        'content="Declan Holden V Ger Brennan Construction"></head><body>',
+    )
+    resp = response("https://example.ie/en/cases/2025/july/adj-00054658.html", page)
+    blank_row = replace(ROW, description=None)
+
+    results = list(
+        spider.parse_detail(resp, blank_row, "Workplace Relations Commission", PARTITION)
+    )
+    stores = [r for r in results if isinstance(r, dict) and r.get("__action__") == "store"]
+    assert len(stores) == 1
+    assert stores[0]["record"].description == "Declan Holden V Ger Brennan Construction"
