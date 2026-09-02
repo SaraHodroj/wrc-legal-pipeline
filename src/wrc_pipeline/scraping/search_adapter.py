@@ -64,7 +64,9 @@ PARAM_MAP = {
     "body": "body",
     "start_date": "from",
     "finish_date": "to",
-    "page": "page",
+    # Confirmed live (2026-09-02): the site's own next-page link reads
+    # `...&pageNumber=2` -- the parameter is `pageNumber`, not `page`.
+    "page": "pageNumber",
 }
 
 #: The site renders dates as D/M/YYYY -- NOT zero-padded (e.g. "1/1/2024",

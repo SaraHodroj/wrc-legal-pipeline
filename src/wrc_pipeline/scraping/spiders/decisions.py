@@ -19,6 +19,7 @@ Two design decisions worth defending in review:
 
 from __future__ import annotations
 
+import re
 import uuid
 from collections.abc import AsyncIterator, Iterator
 from datetime import UTC, date, datetime
@@ -252,7 +253,7 @@ class DecisionsSpider(scrapy.Spider):
         if doc_type is DocumentType.HTML or doc_type is DocumentType.UNKNOWN:
             # The detail page may itself embed a link to a PDF. If so, follow
             # it -- the primary document beats the HTML wrapper around it.
-            document_href = self._document_link(response)
+            document_href = self._document_link(response, row.identifier)
             if document_href:
                 yield response.follow(
                     document_href,
@@ -266,6 +267,10 @@ class DecisionsSpider(scrapy.Spider):
                         "title": self._extract_title(response),
                     },
                     meta={"partition_key": partition.key, "body_name": body_name},
+                    # Document requests are already keyed one-per-record by the
+                    # identifier match above; letting the dupefilter drop one
+                    # would silently lose a record with no failure logged.
+                    dont_filter=True,
                 )
                 return
 
@@ -419,31 +424,30 @@ class DecisionsSpider(scrapy.Spider):
         self._store.close()
 
     # ----------------------------------------------------------------- helpers
-    #: Link-target fragments that mark site furniture, never the decision
-    #: document. Learned from a live run: every WRC detail page links the
-    #: cookie-policy PDF from its consent banner, and a naive "first PDF link
-    #: on the page" selector routed all ten records of the smoke test to
-    #: /en/privacy-policy/cookie_policy.pdf (a 404) instead of the decision.
-    CHROME_LINK_FRAGMENTS = ("cookie", "privacy-policy", "privacy_policy")
-
     _DOC_LINK_CSS = (
         "a[href$='.pdf']::attr(href), a[href$='.doc']::attr(href), "
         "a[href$='.docx']::attr(href)"
     )
 
     @classmethod
-    def _document_link(cls, response: Response) -> str | None:
-        """First document link that plausibly IS the decision.
+    def _document_link(cls, response: Response, identifier: str) -> str | None:
+        """A document link that belongs to THIS record, or ``None``.
 
-        Prefer links inside the main content container (the page chrome lives
-        outside it), fall back to the whole page for legacy markup, and in
-        both cases refuse links that are clearly site furniture.
+        The rule is strict on purpose: the link's target must contain the
+        record's own identifier (compared with separators stripped, so
+        ``IR-SC-00001595`` matches ``ir_sc_00001595.pdf``). Two live runs
+        taught us why -- every WRC detail page also links the cookie-policy
+        PDF and the "Decisions Information Guide" PDF from its chrome, and
+        any looser heuristic (first PDF on the page, PDFs inside <main>)
+        stored site furniture as the decision. A decision's file is named
+        after its reference number on this source; when no such link exists,
+        the detail page itself is the decision and is stored as HTML.
         """
-        main = response.css("main")
-        candidates: list[str] = list(main.css(cls._DOC_LINK_CSS).getall()) if main else []
-        candidates += response.css(cls._DOC_LINK_CSS).getall()
-        for href in candidates:
-            if not any(frag in href.lower() for frag in cls.CHROME_LINK_FRAGMENTS):
+        slug = re.sub(r"[^a-z0-9]", "", identifier.lower())
+        if not slug:
+            return None
+        for href in response.css(cls._DOC_LINK_CSS).getall():
+            if slug in re.sub(r"[^a-z0-9]", "", href.lower()):
                 return str(href)
         return None
 

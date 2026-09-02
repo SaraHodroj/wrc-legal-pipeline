@@ -329,7 +329,7 @@ def test_pagination_falls_back_to_a_constructed_url(spider):
     resp = response("https://example.ie/en/search/?decisions=1", PAGE_ONE_OF_MANY)
     requests = list(spider.parse_search(resp, "Workplace Relations Commission", PARTITION, 1))
 
-    page_two = [r for r in requests if "page=2" in r.url]
+    page_two = [r for r in requests if "pageNumber=2" in r.url]
     assert len(page_two) == 1
     assert page_two[0].cb_kwargs["page"] == 2
 

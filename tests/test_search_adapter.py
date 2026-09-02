@@ -184,7 +184,7 @@ def test_search_url_includes_page_param_when_paginating():
     url = ADAPTER.build_search_url(
         "Labour Court", date(2024, 1, 1), date(2024, 1, 31), page=2
     )
-    assert "page=2" in url
+    assert "pageNumber=2" in url  # param name confirmed from the site's own pager link
 
 
 def test_unknown_body_name_raises_immediately():
