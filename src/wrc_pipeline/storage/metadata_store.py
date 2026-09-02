@@ -63,8 +63,12 @@ class MetadataStore:
         return self.db[self._settings.curated_collection]
 
     @property
+    def observations(self) -> Collection:
+        return self.db[self._settings.observations_collection]
+
+    @property
     def failures(self) -> Collection:
-        return self.db["failed_records"]
+        return self.db[self._settings.failures_collection]
 
     def ensure_indexes(self) -> None:
         """Create the indexes the pipeline depends on. Safe to re-run.
@@ -93,11 +97,17 @@ class MetadataStore:
         self.landing.create_index([("run_id", ASCENDING)], name="ix_run_id")
 
         self.curated.create_index(
-            [("identifier", ASCENDING), ("body", ASCENDING)],
+            [("source", ASCENDING), ("identifier", ASCENDING), ("body", ASCENDING)],
             unique=True,
-            name="uq_identifier_body",
+            name="uq_source_identifier_body",
         )
         self.curated.create_index([("partition_date", ASCENDING)], name="ix_partition_date")
+
+        self.observations.create_index(
+            [("source", ASCENDING), ("identifier", ASCENDING), ("body", ASCENDING)],
+            name="ix_source_identifier_body",
+        )
+        self.observations.create_index([("run_id", ASCENDING)], name="ix_obs_run_id")
 
         self.failures.create_index([("run_id", ASCENDING)], name="ix_run_id")
         logger.info("Mongo indexes ensured", extra={"event": "indexes_ensured"})
@@ -117,7 +127,11 @@ class MetadataStore:
 
     # ------------------------------------------------------- idempotency index
     def load_known_hashes(
-        self, start: date, end: date, bodies: Iterable[str] | None = None
+        self,
+        start: date,
+        end: date,
+        bodies: Iterable[str] | None = None,
+        source: str | None = None,
     ) -> dict[tuple[str, str], str | None]:
         """Preload ``{(identifier, body): file_hash}`` for a date window.
 
@@ -139,6 +153,8 @@ class MetadataStore:
         query: dict[str, Any] = {"partition_date": {"$gte": _as_dt(start), "$lte": _as_dt(end)}}
         if bodies:
             query["body"] = {"$in": list(bodies)}
+        if source:
+            query["source"] = source
 
         projection = {"identifier": 1, "body": 1, "file_hash": 1, "first_seen_at": 1}
         # Versions are append-only, so a record may have several rows; the
@@ -161,14 +177,15 @@ class MetadataStore:
     def record_version(self, record: DecisionRecord) -> str:
         """Land one content version. Returns 'new' | 'updated' | 'unchanged'.
 
-        The landing zone is append-only: existing rows are never mutated.
+        The landing zone is strictly INSERT-only -- existing rows are never
+        mutated, not even audit fields.
         - No prior version of (identifier, body): INSERT -> 'new'.
-        - A prior version with this exact hash: touch its audit trail only
-          (last_seen_at / last_seen_run_id) -> 'unchanged'.
+        - A prior version with this exact hash: record a sighting in the
+          separate ``record_observations`` collection -> 'unchanged'.
         - Prior versions exist but this hash is new (an amended decision):
           INSERT a fresh version row -> 'updated'. The old row, its object and
-          its hash all remain untouched, which is what gives us free amendment
-          history and an auditable past.
+          its hash all remain untouched -- free amendment history and an
+          auditable past.
         """
         existing_same_hash = self.landing.find_one(
             {
@@ -180,10 +197,7 @@ class MetadataStore:
             {"_id": 1},
         )
         if existing_same_hash is not None:
-            self.landing.update_one(
-                {"_id": existing_same_hash["_id"]},
-                {"$set": {"last_seen_at": datetime.now(UTC), "last_seen_run_id": record.run_id}},
-            )
+            self.record_sighting(record.source, record.identifier, record.body, record.run_id)
             return "unchanged"
 
         any_prior = self.landing.find_one(
@@ -202,23 +216,22 @@ class MetadataStore:
             return "unchanged"
         return "updated" if any_prior is not None else "new"
 
-    def touch_last_seen(self, identifier: str, body: str, run_id: str) -> None:
-        """Mark a known record as seen in this run without rewriting it.
+    def record_sighting(self, source: str, identifier: str, body: str, run_id: str) -> None:
+        """Append one 'seen again, unchanged' observation.
 
-        Landing-zone data is immutable, so we never touch the content fields --
-        only the audit trail (last_seen_at / last_seen_run_id) that proves the
-        record still exists upstream. Touches the latest version row.
+        Kept in a SEPARATE collection so that landing rows are never updated
+        at all -- not even audit fields. "When was this record last confirmed
+        upstream?" is answered by the newest observation, and the landing zone
+        stays byte-for-byte what each run originally inserted.
         """
-        latest = self.landing.find_one(
-            {"identifier": identifier, "body": body},
-            {"_id": 1, "first_seen_at": 1},
-            sort=[("first_seen_at", -1)],
-        )
-        if latest is None:
-            return
-        self.landing.update_one(
-            {"_id": latest["_id"]},
-            {"$set": {"last_seen_at": datetime.now(UTC), "last_seen_run_id": run_id}},
+        self.observations.insert_one(
+            {
+                "source": source,
+                "identifier": identifier,
+                "body": body,
+                "run_id": run_id,
+                "observed_at": datetime.now(UTC),
+            }
         )
 
     def bulk_upsert_curated(self, records: list[dict[str, Any]]) -> int:
@@ -228,7 +241,11 @@ class MetadataStore:
 
         operations = [
             UpdateOne(
-                {"identifier": rec["identifier"], "body": rec["body"]},
+                {
+                    "source": rec.get("source", "wrc"),
+                    "identifier": rec["identifier"],
+                    "body": rec["body"],
+                },
                 {"$set": to_bson_safe(rec)},
                 upsert=True,
             )

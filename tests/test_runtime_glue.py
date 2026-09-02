@@ -292,3 +292,22 @@ def test_partial_transform_fails_the_curated_materialization(monkeypatch):
     context = build_asset_context(partition_key="2024-03-01")
     with _pytest.raises(RuntimeError, match="3 record"):
         defs_mod.curated_decisions(context)
+
+
+def test_weekly_amendment_sweep_targets_partition_with_recheck_tag():
+    """Round-2 review regression: the documented amendment sweep must actually
+    exist -- a scheduled run that re-checks known records via the tag the
+    landing asset translates into --recheck-known."""
+    from datetime import UTC, datetime
+
+    from dagster import RunRequest, build_schedule_context
+
+    from wrc_pipeline.orchestration.definitions import weekly_sweep
+
+    context = build_schedule_context(
+        scheduled_execution_time=datetime(2024, 3, 17, 3, 0, tzinfo=UTC)
+    )
+    request = weekly_sweep(context)
+    assert isinstance(request, RunRequest)
+    assert request.partition_key == "2024-03-01"
+    assert request.tags["recheck_known"] == "true"

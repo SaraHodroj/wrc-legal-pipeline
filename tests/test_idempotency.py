@@ -7,7 +7,8 @@ Two requirements meet here and must BOTH hold:
 * "Don't delete/update any of the stored data in the Landing Zone."
 
 The design that satisfies both is an append-only, hash-versioned landing zone:
-an unchanged re-run inserts nothing (only the audit trail is touched), while
+an unchanged re-run inserts nothing into landing (a sighting is appended to
+the separate observations collection), while
 changed content lands as a NEW version row under a NEW object key -- the
 previous version is never mutated.
 
@@ -110,18 +111,22 @@ def test_identifier_normalisation_prevents_duplicate_rows(store):
     assert store.landing.count_documents({}) == 1
 
 
-def test_touch_updates_audit_without_touching_content(store):
-    """Only the audit trail (last_seen_*) may change on a re-run."""
+def test_landing_rows_are_never_updated_not_even_audit_fields(store):
+    """Round-2 review regression: 'don't update Landing Zone data' is read
+    LITERALLY. A re-run sighting goes to the separate record_observations
+    collection; the landing row stays byte-for-byte identical."""
     store.record_version(make_record())
     before = store.landing.find_one({})
 
-    store.touch_last_seen("ADJ-00054658", "Workplace Relations Commission", "run-9")
-    after = store.landing.find_one({})
+    store.record_sighting("wrc", "ADJ-00054658", "Workplace Relations Commission", "run-9")
+    store.record_version(make_record(run_id="run-9"))  # unchanged re-run
 
-    assert after["file_hash"] == before["file_hash"]
-    assert after["storage_path"] == before["storage_path"]
-    assert after["run_id"] == before["run_id"]
-    assert after["last_seen_run_id"] == "run-9"
+    after = store.landing.find_one({})
+    assert after == before  # the whole document, not selected fields
+
+    observations = list(store.observations.find({}))
+    assert len(observations) == 2
+    assert all(o["run_id"] == "run-9" for o in observations)
 
 
 def test_iter_latest_landing_returns_one_doc_per_record(store):

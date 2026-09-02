@@ -2,10 +2,11 @@
 
 ## Date partition size: monthly
 
-Monthly balances three pressures. **Result-set depth**: the source's search UI
-paginates, and a month across the four bodies is a few hundred records — one
-or two pages. A yearly partition would push the busiest bodies into deep,
-unreliable pagination; daily would mean ~1,460 mostly-empty requests/year/body.
+Monthly balances three pressures. **Result-set depth**: the source pages ten
+results at a time, so a busy month is ~20-30 pages per body — shallow enough
+to walk reliably, where a yearly partition would mean hundreds of pages of
+deep, flaky pagination and daily would mean ~1,460 mostly-empty
+requests/year/body.
 **Blast radius**: a partition is the retry unit — one failure re-runs a month,
 not a decade. **Source behaviour**: decisions get amended after publication,
 so the current month is never "final" and needs cheap, frequent re-runs.
@@ -36,14 +37,16 @@ file_hash)` under a **unique index** (identifiers normalised first — the site
 formats them inconsistently). Object keys embed the content hash, so nothing
 is ever overwritten; an amended decision lands as a *new* version beside the
 old one (free amendment history), and the previous version is never mutated —
-satisfying "don't update/delete Landing Zone data" literally.
+satisfying "don't update/delete Landing Zone data" literally — even "seen
+again" audit sightings live in a separate append-only `record_observations`
+collection, so landing rows are frozen at insert.
 
 Idempotency operates at the **network level**: known `(identifier, body)`
 pairs are skipped at *listing* time, before their detail page or document is
 requested — a second run of the same window re-downloads nothing
-(`SCRAPE_RECHECK_KNOWN=true` flips to re-fetch-and-hash-compare for a
-scheduled amendment sweep; ETag/If-Modified-Since would be preferable but this
-source doesn't serve them dependably). The known-hash index loads **once per
+(the `weekly_amendment_sweep` schedule re-fetches known records with
+`--recheck-known` and hash-compares them; ETag/If-Modified-Since would be
+preferable but this source doesn't serve them dependably). The known-hash index loads **once per
 run** as one range query — a per-record Mongo call would block Twisted's
 reactor. Every run ends with a per-`(body, partition)` **reconciliation
 ledger** (source-reported vs discovered vs succeeded/skipped/failed, status
@@ -56,8 +59,9 @@ Already structured for this: all site-specific logic lives behind one
 `SearchAdapter` protocol with a **source registry** (`SOURCE_ADAPTERS`,
 selected by `SCRAPE_SOURCE`), and every record carries a `source` field in its
 natural key. Adding a source means registering one adapter, not pipeline
-edits. The transform streams Mongo in **bounded batches** (configurable), so
-memory is flat at any corpus size.
+edits. The transform streams documents in **bounded batches** (configurable); the
+version-resolution pass holds ~100 bytes per record, fine to tens of millions,
+beyond which it moves to a server-side aggregation.
 
 What changes at that scale: **config becomes data** — a declarative per-source
 registry (URL, adapter, rate limits, robots policy, legal basis) that the

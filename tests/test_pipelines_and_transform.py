@@ -113,33 +113,31 @@ def test_object_metadata_carries_provenance(pipeline):
     assert head["Metadata"]["run-id"] == "test-run"
 
 
-def test_touch_action_updates_audit_only(pipeline):
-    pipeline._store(
-        ItemAdapter(
-            {
-                "__action__": "store",
-                "record": make_record(),
-                "payload": b"<html>decision</html>",
-                "content_type": "text/html",
-            }
-        ),
-        SpiderStub(),
-    )
+def test_touch_action_appends_observation_and_leaves_landing_alone(pipeline):
+    """Round-2 review regression: a 'seen again' touch must not modify the
+    landing row at all -- it appends to record_observations instead."""
+    record = make_record()
+    pipeline.metadata.record_version(record)
+    before = pipeline.metadata.landing.find_one({})
+
     pipeline._touch(
         ItemAdapter(
             {
                 "__action__": "touch",
-                "identifier": "ADJ-00054658",
-                "body": "Workplace Relations Commission",
+                "identifier": record.identifier,
+                "body": record.body,
             }
         ),
         SpiderStub(),
     )
-    stored = pipeline.metadata.landing.find_one({})
-    assert stored["last_seen_run_id"] == "test-run"
+
+    assert pipeline.metadata.landing.find_one({}) == before  # byte-identical
+    observation = pipeline.metadata.observations.find_one({})
+    assert observation is not None
+    assert observation["identifier"] == record.identifier
 
 
-# -------------------------------------------------------------- transform job
+# ------------------------------------------------------------------ transform
 HTML_PAGE = (
     "<html><body>"
     '<nav class="navigation">Cases | Contact</nav>'

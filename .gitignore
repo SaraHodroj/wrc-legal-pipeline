@@ -17,3 +17,8 @@ logs/
 *.jsonl
 .dagster/
 tmp/
+
+# Dagster scratch homes created by `dagster dev` and local run logs
+.tmp_dagster_home_*/
+tmp_dagster_home_*/
+*.jsonl

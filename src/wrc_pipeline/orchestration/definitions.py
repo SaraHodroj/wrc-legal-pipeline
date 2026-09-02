@@ -56,9 +56,11 @@ from ..transform.job import transform_window
 settings = get_settings()
 
 # Partition definition drives both the UI and the backfill machinery.
-# Start date is the earliest period we intend to hold; extend it to widen the
-# historical backfill without touching any other code.
-monthly_partitions = MonthlyPartitionsDefinition(start_date="2015-10-01")
+# Start date is config (ORCH_PARTITION_START_DATE): widen the historical
+# backfill without touching code.
+monthly_partitions = MonthlyPartitionsDefinition(
+    start_date=settings.orchestration.partition_start_date
+)
 
 # Transient network failures are the normal case for a crawler, not the
 # exception. Exponential backoff on the partition as a whole complements the
@@ -95,6 +97,11 @@ def landing_decisions(context: AssetExecutionContext) -> dict:
         "--partition-size", "monthly",
         "--run-id", run_id,
     ]
+    # The weekly amendment sweep launches this same asset with a run tag; the
+    # flag re-fetches KNOWN records so silently amended decisions get
+    # hash-compared (default runs never re-download known records).
+    if context.run.tags.get("recheck_known") == "true":
+        command.append("--recheck-known")
     context.log.info("Launching crawl subprocess: %s", " ".join(command))
 
     completed = subprocess.run(
@@ -102,9 +109,9 @@ def landing_decisions(context: AssetExecutionContext) -> dict:
         capture_output=True,
         text=True,
         check=False,
-        # A single month should never take this long; if it does, something is
-        # wrong upstream and we would rather fail loudly than hang the backfill.
-        timeout=60 * 60,
+        # A single month should never take longer than this configurable
+        # ceiling; if it does, fail loudly rather than hang the backfill.
+        timeout=settings.orchestration.crawl_timeout_seconds,
     )
 
     # The child writes JSONL to stdout; surface it in the Dagster run log so
@@ -172,8 +179,8 @@ ingest_and_transform = define_asset_job(
 @schedule(
     name="daily_current_month_refresh",
     job=ingest_and_transform,
-    cron_schedule="0 2 * * *",
-    execution_timezone="Europe/Dublin",
+    cron_schedule=settings.orchestration.refresh_cron,
+    execution_timezone=settings.orchestration.timezone,
 )
 def daily_refresh(context: ScheduleEvaluationContext) -> RunRequest:
     """Materialize the month the scheduled tick falls in."""
@@ -184,8 +191,33 @@ def daily_refresh(context: ScheduleEvaluationContext) -> RunRequest:
         partition_key=partition_key,
     )
 
+
+@schedule(
+    name="weekly_amendment_sweep",
+    job=ingest_and_transform,
+    cron_schedule=settings.orchestration.sweep_cron,
+    execution_timezone=settings.orchestration.timezone,
+)
+def weekly_sweep(context: ScheduleEvaluationContext) -> RunRequest:
+    """Re-check KNOWN records of the current month for silent amendments.
+
+    Unlike the nightly refresh (which only picks up NEW records and never
+    re-downloads known ones), this run carries the ``recheck_known`` tag, so
+    the crawl subprocess gets ``--recheck-known``: every known record is
+    re-fetched and hash-compared, and an amended decision lands as a new
+    immutable version. Sweep older windows by launching a backfill of this
+    job with the same tag.
+    """
+    today = context.scheduled_execution_time.date()
+    partition_key = today.replace(day=1).isoformat()
+    return RunRequest(
+        run_key=f"sweep-{partition_key}-{today.isoformat()}",
+        partition_key=partition_key,
+        tags={"recheck_known": "true"},
+    )
+
 defs = Definitions(
     assets=[landing_decisions, curated_decisions],
     jobs=[ingest_and_transform],
-    schedules=[daily_refresh],
+    schedules=[daily_refresh, weekly_sweep],
 )

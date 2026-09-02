@@ -57,6 +57,7 @@ class DecisionsSpider(scrapy.Spider):
         bodies: str | None = None,
         partition_size: str | None = None,
         run_id: str | None = None,
+        recheck_known: str | None = None,
         *args: Any,
         **kwargs: Any,
     ) -> None:
@@ -76,7 +77,12 @@ class DecisionsSpider(scrapy.Spider):
 
         self.source = settings.scrape.source
         self.adapter = get_adapter(self.source, settings.scrape.base_url)
-        self.recheck_known = settings.scrape.recheck_known
+        # CLI/orchestrator override beats config: the amendment sweep passes
+        # --recheck-known explicitly rather than relying on env mutation.
+        if recheck_known is not None:
+            self.recheck_known = str(recheck_known).strip().lower() in ("1", "true", "yes")
+        else:
+            self.recheck_known = settings.scrape.recheck_known
         self.stats_model = RunStats(run_id=self.run_id)
         self.known_hashes: dict[tuple[str, str], str | None] = {}
         # Detail URLs already yielded, per (body, partition key) -- the guard
@@ -105,7 +111,7 @@ class DecisionsSpider(scrapy.Spider):
         """Preload idempotency state, then fan out across (body, partition)."""
         self._store.ensure_indexes()
         self.known_hashes = self._store.load_known_hashes(
-            self.start_date, self.end_date, self.bodies
+            self.start_date, self.end_date, self.bodies, source=self.source
         )
 
         logger.info(
@@ -410,7 +416,8 @@ class DecisionsSpider(scrapy.Spider):
                     "partition": partition.key,
                 },
             )
-            # Still refresh the audit trail so 'last_seen' stays truthful.
+            # Record an append-only sighting so freshness stays auditable
+            # without ever updating the landing row itself.
             yield {"__action__": "touch", "identifier": record.identifier, "body": record.body}
             return
 

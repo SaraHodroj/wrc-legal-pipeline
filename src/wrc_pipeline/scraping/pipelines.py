@@ -74,12 +74,15 @@ class PersistencePipeline(StorageInitPipeline):
 
     # -- executed on the Twisted thread pool, never on the reactor thread ----
     def _touch(self, adapter: ItemAdapter, spider: Spider) -> dict[str, Any]:
-        self.metadata.touch_last_seen(
+        # An append-only observation row -- the landing collection itself is
+        # never updated, which is what keeps it literally immutable.
+        self.metadata.record_sighting(
+            source=getattr(spider, "source", "wrc"),
             identifier=adapter["identifier"],
             body=adapter["body"],
             run_id=getattr(spider, "run_id", "unknown"),
         )
-        return {"identifier": adapter["identifier"], "action": "touched"}
+        return {"identifier": adapter["identifier"], "action": "observed"}
 
     def _store(self, adapter: ItemAdapter, spider: Spider) -> dict[str, Any]:
         record: DecisionRecord = adapter["record"]

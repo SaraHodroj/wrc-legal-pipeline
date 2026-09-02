@@ -33,6 +33,15 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["daily", "weekly", "monthly", "quarterly", "yearly"],
     )
     parser.add_argument("--run-id", help="Override the generated run id (for replays)")
+    parser.add_argument(
+        "--recheck-known",
+        action="store_true",
+        help=(
+            "Re-fetch records that are already landed and hash-compare them, "
+            "instead of skipping them at listing time -- the amendment sweep. "
+            "Default behaviour (without this flag) never re-downloads known records."
+        ),
+    )
     return parser
 
 
@@ -65,6 +74,7 @@ def main(argv: list[str] | None = None) -> int:
         bodies=args.bodies,
         partition_size=args.partition_size,
         run_id=args.run_id,
+        recheck_known="true" if args.recheck_known else None,
     )
     # Blocks until the crawl finishes. Note: Twisted's reactor cannot be
     # restarted within a process, which is why the orchestrator launches this

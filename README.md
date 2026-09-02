@@ -24,7 +24,7 @@ python -m venv .venv && source .venv/bin/activate
 make install     # pip install -e ".[dev]"
 
 # 4. Verify offline
-make test        # 122 tests, no infrastructure required
+make test        # 126 tests, no infrastructure required
 
 # 5. Verify the live site still matches the adapter (2 polite GETs, no infra)
 make check-site  # or: python scripts/check_site_contract.py
@@ -89,8 +89,8 @@ contact address.
           ▼                                         ▼
 ┌────────────────────┐                    ┌────────────────────┐
 │ MinIO curated-zone │                    │ Mongo curated_     │
-│ {body}/            │◄───────────────────│ decisions          │
-│ {identifier}.{ext} │                    │ + new file_hash    │
+│ {identifier}.{ext} │◄───────────────────│ decisions          │
+│ (flat, per brief)  │                    │ + new file_hash    │
 └────────────────────┘                    └────────────────────┘
 ```
 
@@ -174,9 +174,12 @@ make ingest START=2024-01-01 END=2024-02-01   # records_skipped_known == records
 ```
 
 The landing zone is **append-only and hash-versioned**: an amended decision
-lands as a new version row and a new object key beside the old one -- stored
-landing data is never updated or deleted. Set `SCRAPE_RECHECK_KNOWN=true` to
-re-fetch known records and hash-compare them (the scheduled amendment sweep).
+lands as a new version row and a new object key beside the old one, and
+landing rows are never updated at all -- "seen again" sightings go to the
+separate `record_observations` collection. Amendment detection is a real
+scheduled job: the `weekly_amendment_sweep` Dagster schedule (or
+`--recheck-known` on the CLI) re-fetches known records and hash-compares
+them.
 
 Every run ends with a per-(body, partition) reconciliation ledger in the
 `run_summary` line, and the exit code reflects it: `0` all partitions
@@ -188,7 +191,7 @@ failed. See `ARCHITECTURE.md` for the full strategy.
 ## Testing
 
 ```bash
-make test    # 122 tests across every module: partitioning boundaries, hashing,
+make test    # 126 tests across every module: partitioning boundaries, hashing,
              # HTML extraction, idempotency, search-adapter parsing, spider
              # callbacks, persistence pipeline, transform job, logging, CLI,
              # and a Dagster definitions smoke test. ~83% line coverage.

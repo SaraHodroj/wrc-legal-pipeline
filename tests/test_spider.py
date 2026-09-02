@@ -456,3 +456,39 @@ def test_partial_status_when_some_records_fail():
     assert ledger.unaccounted == 0
     assert ledger.status == "partial"
     assert stats.run_status == "partial"
+
+
+def test_listing_gap_makes_partition_partial_never_complete():
+    """Round-2 review regression, exact scenario: source says 10, we only
+    discovered 9, all 9 succeeded. That is NOT complete -- one record fell
+    through listing parsing/pagination and must surface."""
+    from wrc_pipeline.models import RunStats
+
+    stats = RunStats(run_id="t")
+    ledger = stats.partition("Labour Court", "2024-01-01")
+    ledger.source_reported = 10
+    ledger.rows_discovered = 9
+    ledger.records_succeeded = 9
+
+    assert ledger.listing_gap == 1
+    assert ledger.status == "partial"
+    assert stats.run_status == "partial"
+
+
+def test_recheck_known_cli_flag_reaches_the_spider():
+    from wrc_pipeline.scraping.runner import build_parser
+
+    args = build_parser().parse_args(["--recheck-known"])
+    assert args.recheck_known is True
+    assert build_parser().parse_args([]).recheck_known is False
+
+
+def test_spider_recheck_kwarg_overrides_config():
+    spider = DecisionsSpider(
+        start_date="2025-07-01",
+        end_date="2025-08-01",
+        bodies="Workplace Relations Commission",
+        run_id="t",
+        recheck_known="true",
+    )
+    assert spider.recheck_known is True

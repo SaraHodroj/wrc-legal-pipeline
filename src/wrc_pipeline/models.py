@@ -98,8 +98,9 @@ class DecisionRecord(BaseModel):
     file_size_bytes: int | None = None
 
     # --- Audit --------------------------------------------------------------
+    # No last_seen_at here: landing rows are frozen at insert; "last confirmed
+    # upstream" lives in the append-only record_observations collection.
     first_seen_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
-    last_seen_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     content_changed_at: datetime | None = None
 
     @field_validator("identifier")
@@ -173,13 +174,32 @@ class PartitionStats(BaseModel):
         )
 
     @property
+    def listing_gap(self) -> int:
+        """Records the source claims to hold that we never even discovered.
+
+        "Shows 1 to 10 of 200 results" with only 190 rows parsed means ten
+        records silently fell through listing-row parsing or pagination --
+        the exact under-reporting the brief's 200 / 200-X rule forbids from
+        passing unnoticed. (Deliberately trimmed rows -- the smoke-test record
+        cap -- also surface here, which is honest: a capped run IS partial.)
+        """
+        if self.source_reported is None:
+            return 0
+        return max(self.source_reported - self.rows_discovered, 0)
+
+    @property
     def status(self) -> str:
         """complete | partial | failed -- derived from the ledger."""
         if self.search_failed or (
             self.rows_discovered == 0 and (self.source_reported or 0) > 0
         ):
             return "failed"
-        if self.records_failed > 0 or self.unaccounted > 0 or self.page_cap_hit:
+        if (
+            self.records_failed > 0
+            or self.unaccounted > 0
+            or self.listing_gap > 0
+            or self.page_cap_hit
+        ):
             return "partial"
         return "complete"
 
@@ -193,6 +213,7 @@ class PartitionStats(BaseModel):
             "records_skipped_known": self.records_skipped_known,
             "records_failed": self.records_failed,
             "unaccounted": self.unaccounted,
+            "listing_gap": self.listing_gap,
             "pages_fetched": self.pages_fetched,
             "page_cap_hit": self.page_cap_hit,
             "status": self.status,

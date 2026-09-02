@@ -34,9 +34,13 @@ class MongoSettings(BaseSettings):
 
     uri: str = "mongodb://root:example@localhost:27017"
     database: str = "wrc"
-    # Landing zone is append-only; curated is written by the transform stage.
+    # Landing zone is strictly insert-only; curated is written by the
+    # transform stage; observations records "seen again, unchanged" sightings
+    # so landing rows are never updated, not even their audit fields.
     landing_collection: str = "landing_decisions"
     curated_collection: str = "curated_decisions"
+    observations_collection: str = "record_observations"
+    failures_collection: str = "failed_records"
     runs_collection: str = "pipeline_runs"
     server_selection_timeout_ms: int = 5_000
 
@@ -154,6 +158,23 @@ class ScrapeSettings(BaseSettings):
         return value
 
 
+class OrchestrationSettings(BaseSettings):
+    """Dagster wiring: partition range, schedules, subprocess limits."""
+
+    model_config = SettingsConfigDict(env_prefix="ORCH_", env_file=_ENV_FILE, extra="ignore")
+
+    #: Earliest monthly partition the asset graph exposes for backfill.
+    partition_start_date: str = "2015-10-01"
+    #: Hard ceiling for one partition's crawl subprocess.
+    crawl_timeout_seconds: int = 60 * 60
+    #: Nightly re-run of the current month (idempotent: re-downloads nothing).
+    refresh_cron: str = "0 2 * * *"
+    #: Weekly amendment sweep: re-fetches KNOWN records of the current month
+    #: with --recheck-known and hash-compares them.
+    sweep_cron: str = "0 3 * * 0"
+    timezone: str = "Europe/Dublin"
+
+
 class TransformSettings(BaseSettings):
     """Transformation-stage behaviour."""
 
@@ -183,6 +204,7 @@ class Settings(BaseSettings):
     mongo: MongoSettings = Field(default_factory=MongoSettings)
     object_store: ObjectStoreSettings = Field(default_factory=ObjectStoreSettings)
     scrape: ScrapeSettings = Field(default_factory=ScrapeSettings)
+    orchestration: OrchestrationSettings = Field(default_factory=OrchestrationSettings)
     transform: TransformSettings = Field(default_factory=TransformSettings)
     run: RunSettings = Field(default_factory=RunSettings)
 
