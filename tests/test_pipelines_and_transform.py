@@ -186,7 +186,7 @@ def test_html_is_cleaned_renamed_and_rehashed(transform_env):
     settings, objects = transform_env
     doc = landing_doc(objects, settings, HTML_PAGE.encode(), "html")
 
-    result = _transform_one(doc, objects, settings, run_id="t-run")
+    result = _transform_one(doc, objects, settings, "t-run", {})
 
     assert result is not None
     # Renamed to identifier.ext in the curated bucket.
@@ -206,7 +206,7 @@ def test_pdf_passes_through_byte_identical(transform_env):
     payload = b"%PDF-1.4 original bytes"
     doc = landing_doc(objects, settings, payload, "pdf")
 
-    result = _transform_one(doc, objects, settings, run_id="t-run")
+    result = _transform_one(doc, objects, settings, "t-run", {})
 
     curated = objects.get_bytes(*ObjectStore.parse_uri(result["storage_path"]))
     assert curated == payload
@@ -217,8 +217,28 @@ def test_transform_rerun_is_idempotent(transform_env):
     settings, objects = transform_env
     doc = landing_doc(objects, settings, HTML_PAGE.encode(), "html")
 
-    assert _transform_one(doc, objects, settings, run_id="run-1") is not None
-    assert _transform_one(doc, objects, settings, run_id="run-2") is None  # unchanged -> skip
+    first = _transform_one(doc, objects, settings, "run-1", {})
+    assert first is not None
+    # Second run, with the curated metadata now reflecting the first run:
+    # both the object AND the metadata are verified current -> full skip.
+    curated_index = {(doc["identifier"], doc["body"]): first["file_hash"]}
+    assert _transform_one(doc, objects, settings, "run-2", curated_index) is None
+
+
+def test_existing_object_does_not_mask_missing_metadata(transform_env):
+    """Recovery regression: if a previous run uploaded the curated object but
+    died before writing Mongo, the rerun must re-emit the metadata row -- an
+    existing object alone is NOT proof the record is done."""
+    settings, objects = transform_env
+    doc = landing_doc(objects, settings, HTML_PAGE.encode(), "html")
+
+    first = _transform_one(doc, objects, settings, "run-1", {})
+    assert first is not None
+    # Simulate the crash: object exists, but curated metadata was never
+    # written (empty curated_index). The rerun must produce the row again.
+    repaired = _transform_one(doc, objects, settings, "run-2", {})
+    assert repaired is not None
+    assert repaired["file_hash"] == first["file_hash"]
 
 
 def test_transform_never_touches_the_landing_object(transform_env):
@@ -226,7 +246,7 @@ def test_transform_never_touches_the_landing_object(transform_env):
     payload = HTML_PAGE.encode()
     doc = landing_doc(objects, settings, payload, "html")
 
-    _transform_one(doc, objects, settings, run_id="t-run")
+    _transform_one(doc, objects, settings, "t-run", {})
 
     bucket, key = ObjectStore.parse_uri(doc["storage_path"])
     assert objects.get_bytes(bucket, key) == payload  # byte-identical
@@ -239,7 +259,7 @@ def test_curated_filename_is_literally_identifier_ext_no_subfolder(transform_env
     settings, objects = transform_env
     doc = landing_doc(objects, settings, HTML_PAGE.encode(), "html")
 
-    result = _transform_one(doc, objects, settings, run_id="t-run")
+    result = _transform_one(doc, objects, settings, "t-run", {})
 
     bucket, key = ObjectStore.parse_uri(result["storage_path"])
     assert key == "ADJ-00054658.html", f"expected flat 'identifier.ext', got {key!r}"
@@ -251,4 +271,4 @@ def test_empty_extraction_raises_rather_than_storing_garbage(transform_env):
     doc = landing_doc(objects, settings, b"<html><body></body></html>", "html")
 
     with pytest.raises(ValueError, match="empty"):
-        _transform_one(doc, objects, settings, run_id="t-run")
+        _transform_one(doc, objects, settings, "t-run", {})

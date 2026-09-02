@@ -22,7 +22,7 @@ from twisted.internet.threads import deferToThread
 
 from ..config import get_settings
 from ..logging_setup import get_logger
-from ..models import DecisionRecord
+from ..models import DecisionRecord, FailedRecord
 from ..storage.metadata_store import MetadataStore
 from ..storage.object_store import ObjectStore
 
@@ -55,10 +55,10 @@ class PersistencePipeline(StorageInitPipeline):
 
     Order matters: the file is written **before** the metadata row. If the
     process dies between the two, we are left with an orphaned object in the
-    bucket -- harmless, and cleaned up by the deterministic key on the next
-    run. The reverse order would leave a metadata record pointing at a file
-    that does not exist, which is a genuine data-integrity bug for every
-    downstream consumer.
+    bucket -- harmless and inert (keys are content-addressed, so the next run
+    writes the same key and then lands the metadata). The reverse order would
+    leave a metadata record pointing at a file that does not exist, which is a
+    genuine data-integrity bug for every downstream consumer.
     """
 
     def process_item(self, item: Any, spider: Spider) -> Any:
@@ -85,23 +85,29 @@ class PersistencePipeline(StorageInitPipeline):
         record: DecisionRecord = adapter["record"]
         payload: bytes = adapter["payload"]
 
-        key = record.storage_key()
-        uri = self.objects.put_bytes(
-            bucket=self.settings_obj.object_store.landing_bucket,
-            key=key,
-            data=payload,
-            content_type=adapter.get("content_type"),
-            metadata={
-                "identifier": record.identifier,
-                "body": record.body,
-                "partition-date": record.partition_date.isoformat(),
-                "file-hash": record.file_hash or "",
-                "run-id": record.run_id,
-            },
-        )
-        record.storage_path = uri
-
-        outcome = self.metadata.upsert_landing(record)
+        try:
+            key = record.storage_key()
+            uri = self.objects.put_bytes(
+                bucket=self.settings_obj.object_store.landing_bucket,
+                key=key,
+                data=payload,
+                content_type=adapter.get("content_type"),
+                metadata={
+                    "identifier": record.identifier,
+                    "body": record.body,
+                    "partition-date": record.partition_date.isoformat(),
+                    "file-hash": record.file_hash or "",
+                    "run-id": record.run_id,
+                },
+            )
+            record.storage_path = uri
+            outcome = self.metadata.record_version(record)
+        except Exception as exc:
+            # A storage failure after a successful download must still be an
+            # attributed, per-record failure -- it never passes through the
+            # request errback, so capture it here or it vanishes.
+            self._record_storage_failure(record, spider, exc)
+            return {"identifier": record.identifier, "action": "storage_failed"}
 
         stats = getattr(spider, "stats_model", None)
         if stats is not None:
@@ -110,6 +116,7 @@ class PersistencePipeline(StorageInitPipeline):
                 stats.records_new += 1
             elif outcome == "updated":
                 stats.records_updated += 1
+            stats.partition(record.body, record.partition_date.isoformat()).records_succeeded += 1
 
         logger.info(
             "Record persisted",
@@ -120,10 +127,45 @@ class PersistencePipeline(StorageInitPipeline):
                 "body": record.body,
                 "partition": record.partition_date.isoformat(),
                 "document_type": record.document_type,
-                "storage_path": uri,
+                "storage_path": record.storage_path,
                 "file_hash": record.file_hash,
                 "bytes": record.file_size_bytes,
                 "outcome": outcome,
             },
         )
         return {"identifier": record.identifier, "action": outcome}
+
+    def _record_storage_failure(
+        self, record: DecisionRecord, spider: Spider, exc: Exception
+    ) -> None:
+        reason = f"storage: {type(exc).__name__}: {exc}"
+        entry = {
+            "url": record.document_url or record.source_url,
+            "reason": reason,
+            "http_status": None,
+            "partition": record.partition_date.isoformat(),
+            "body": record.body,
+        }
+        stats = getattr(spider, "stats_model", None)
+        if stats is not None:
+            stats.storage_failures += 1
+            stats.failures.append(entry)
+            stats.partition(record.body, record.partition_date.isoformat()).records_failed += 1
+        logger.error(
+            "Storage failed for record",
+            extra={"event": "storage_failed", "run_id": record.run_id,
+                   "identifier": record.identifier, **entry},
+        )
+        try:
+            self.metadata.record_failure(
+                FailedRecord(
+                    identifier=record.identifier,
+                    url=record.document_url or record.source_url,
+                    body=record.body,
+                    partition_date=record.partition_date,
+                    run_id=record.run_id,
+                    reason=reason,
+                )
+            )
+        except Exception:  # pragma: no cover - bookkeeping must not kill the crawl
+            logger.exception("Could not persist storage-failure record")

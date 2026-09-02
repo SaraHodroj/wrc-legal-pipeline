@@ -31,10 +31,16 @@ from scrapy.http import Response
 from ...config import get_settings
 from ...hashing import hash_bytes
 from ...logging_setup import get_logger
-from ...models import DecisionRecord, DocumentType, FailedRecord, RunStats
+from ...models import (
+    DecisionRecord,
+    DocumentType,
+    FailedRecord,
+    RunStats,
+    normalise_identifier,
+)
 from ...partitioning import Partition, iter_partitions
 from ...storage.metadata_store import MetadataStore
-from ..search_adapter import WrcSearchAdapter
+from ..search_adapter import get_adapter
 
 logger = get_logger(__name__)
 
@@ -43,13 +49,6 @@ class DecisionsSpider(scrapy.Spider):
     """Crawl WRC decisions for a date window, one partition at a time."""
 
     name = "decisions"
-
-    custom_settings: dict[str, Any] = {
-        # Detail pages are HTML; documents can be many MB. Cap the in-memory
-        # response size so one pathological file cannot exhaust the worker.
-        "DOWNLOAD_MAXSIZE": 100 * 1024 * 1024,
-        "DOWNLOAD_WARNSIZE": 20 * 1024 * 1024,
-    }
 
     def __init__(
         self,
@@ -75,7 +74,9 @@ class DecisionsSpider(scrapy.Spider):
         )
         self.run_id = run_id or f"run-{datetime.now(UTC):%Y%m%dT%H%M%S}-{uuid.uuid4().hex[:8]}"
 
-        self.adapter = WrcSearchAdapter(base_url=settings.scrape.base_url)
+        self.source = settings.scrape.source
+        self.adapter = get_adapter(self.source, settings.scrape.base_url)
+        self.recheck_known = settings.scrape.recheck_known
         self.stats_model = RunStats(run_id=self.run_id)
         self.known_hashes: dict[tuple[str, str], str | None] = {}
         # Detail URLs already yielded, per (body, partition key) -- the guard
@@ -116,12 +117,17 @@ class DecisionsSpider(scrapy.Spider):
                 "end_date": self.end_date,
                 "partition_size": self.partition_size,
                 "partitions": len(self._partitions),
+                "recheck_known": self.recheck_known,
                 "bodies": list(self.bodies),
             },
         )
 
+        self.stats_model.partitions_planned = len(self._partitions) * len(self.bodies)
         for partition in self._partitions:
             for body in self.bodies:
+                # Create the ledger up front so a partition whose search request
+                # never returns still shows up -- as failed, not as absent.
+                self.stats_model.partition(body, partition.key)
                 yield self._search_request(body, partition, page=1)
 
     def _search_request(self, body: str, partition: Partition, page: int) -> scrapy.Request:
@@ -141,9 +147,13 @@ class DecisionsSpider(scrapy.Spider):
     # ------------------------------------------------------------------ search
     def parse_search(
         self, response: Response, body_name: str, partition: Partition, page: int
-    ) -> Iterator[scrapy.Request]:
+    ) -> Iterator[scrapy.Request | dict[str, Any]]:
         rows = self.adapter.parse_rows(response.text, response.url)
         total = self.adapter.total_results(response.text)
+        ledger = self.stats_model.partition(body_name, partition.key)
+        ledger.pages_fetched += 1
+        if page == 1:
+            ledger.source_reported = total
 
         logger.info(
             "Search page parsed",
@@ -180,16 +190,32 @@ class DecisionsSpider(scrapy.Spider):
         seen = self._seen_detail_urls.setdefault((body_name, partition.key), set())
         new_rows = [row for row in rows if row.detail_url not in seen]
         seen.update(row.detail_url for row in rows)
+        ledger.rows_discovered += len(new_rows)
 
         if page > 1 and not new_rows:
             return  # the site re-served content we already have -- end of pages
 
         cap = self.settings_obj.scrape.max_records_per_partition
         if cap:
-            new_rows = new_rows[: max(0, cap - (len(seen) - len(new_rows)))]
+            already = len(seen) - len(new_rows)
+            dropped = len(new_rows) - max(0, cap - already)
+            if dropped > 0:
+                ledger.rows_discovered -= dropped  # capped rows were never in scope
+            new_rows = new_rows[: max(0, cap - already)]
 
         for row in new_rows:
             self.stats_model.records_found += 1
+            # Network-level idempotency: a record we already hold is skipped
+            # HERE, before its detail page or document is requested -- running
+            # the same window twice re-downloads nothing. With recheck_known
+            # on, known records are re-fetched and hash-compared instead,
+            # which is how silently amended decisions get picked up.
+            key = (normalise_identifier(row.identifier), body_name)
+            if not self.recheck_known and key in self.known_hashes:
+                self.stats_model.records_skipped_known += 1
+                ledger.records_skipped_known += 1
+                yield {"__action__": "touch", "identifier": key[0], "body": body_name}
+                continue
             yield scrapy.Request(
                 url=row.detail_url,
                 callback=self.parse_detail,
@@ -207,7 +233,18 @@ class DecisionsSpider(scrapy.Spider):
         # back to constructing the next page's URL -- the seen-set above turns
         # a wrong construction into a no-op rather than an infinite loop.
         # Page depth is capped as a circuit breaker either way.
-        if page >= 500:
+        if page >= self.settings_obj.scrape.max_pages_per_partition:
+            ledger.page_cap_hit = True
+            logger.error(
+                "Page cap reached; partition is incomplete",
+                extra={
+                    "event": "page_cap_hit",
+                    "run_id": self.run_id,
+                    "partition": partition.key,
+                    "body": body_name,
+                    "page": page,
+                },
+            )
             return
         next_url = self.adapter.next_page_url(response.text, response.url, page)
         if not next_url and total and len(seen) < total and new_rows:
@@ -344,6 +381,7 @@ class DecisionsSpider(scrapy.Spider):
         """
         file_hash = hash_bytes(payload)
         record = DecisionRecord(
+            source=self.source,
             identifier=row.identifier,
             body=body_name,
             title=title,
@@ -362,6 +400,7 @@ class DecisionsSpider(scrapy.Spider):
         if self.known_hashes.get(key) == file_hash:
             self.stats_model.records_skipped_unchanged += 1
             self.stats_model.records_scraped += 1
+            self.stats_model.partition(record.body, partition.key).records_succeeded += 1
             logger.debug(
                 "Unchanged, skipping write",
                 extra={
@@ -405,6 +444,18 @@ class DecisionsSpider(scrapy.Spider):
         }
         self.stats_model.failures.append(entry)
 
+        # Feed the reconciliation ledger: a failed SEARCH request means the
+        # whole (body, partition) may be under-reported (status: failed); a
+        # failed detail/document request is one attributable missing record.
+        body = request.meta.get("body_name")
+        partition_key = request.meta.get("partition_key")
+        if body and partition_key:
+            ledger = self.stats_model.partition(body, partition_key)
+            if request.callback == self.parse_search:
+                ledger.search_failed = True
+            else:
+                ledger.records_failed += 1
+
         logger.error(
             "Request failed",
             extra={"event": "request_failed", "run_id": self.run_id, **entry},
@@ -428,7 +479,6 @@ class DecisionsSpider(scrapy.Spider):
     def closed(self, reason: str) -> None:
         """Emit the end-of-run summary and release connections."""
         self.stats_model.finished_at = datetime.now(tz=None).astimezone()
-        self.stats_model.partitions_processed = len(self._partitions)
         logger.info("Run complete", extra={**self.stats_model.summary(), "close_reason": reason})
         self._store.close()
 

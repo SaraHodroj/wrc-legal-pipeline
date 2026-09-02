@@ -1,11 +1,18 @@
-"""Idempotency tests.
+"""Idempotency and landing-zone immutability tests.
 
-Requirement 9 is the one that separates a working pipeline from a correct one:
-"Running it twice on the same date range must not create duplicate records or
-re-download unchanged files."
+Two requirements meet here and must BOTH hold:
 
-These tests exercise that against an in-memory Mongo (``mongomock``) so they run
-in CI with no infrastructure.
+* "Running it twice on the same date range must not create duplicate records
+  or re-download unchanged files."
+* "Don't delete/update any of the stored data in the Landing Zone."
+
+The design that satisfies both is an append-only, hash-versioned landing zone:
+an unchanged re-run inserts nothing (only the audit trail is touched), while
+changed content lands as a NEW version row under a NEW object key -- the
+previous version is never mutated.
+
+These tests exercise that against an in-memory Mongo (``mongomock``) so they
+run in CI with no infrastructure.
 """
 
 from datetime import date
@@ -41,47 +48,49 @@ def make_record(*, file_hash: str = "hash-a", run_id: str = "run-1") -> Decision
         document_type=DocumentType.HTML,
         file_hash=file_hash,
         file_size_bytes=1234,
-        storage_path="s3://landing-zone/wrc/2025-07-01/ADJ-00054658.html",
+        storage_path="s3://landing-zone/wrc/2025-07-01/ADJ-00054658/hash-a.html",
     )
 
 
 def test_second_identical_run_creates_no_duplicate(store):
-    assert store.upsert_landing(make_record()) == "new"
-    assert store.upsert_landing(make_record(run_id="run-2")) == "unchanged"
+    assert store.record_version(make_record()) == "new"
+    assert store.record_version(make_record(run_id="run-2")) == "unchanged"
     assert store.landing.count_documents({}) == 1
 
 
-def test_changed_content_updates_in_place(store):
-    store.upsert_landing(make_record(file_hash="hash-a"))
-    outcome = store.upsert_landing(make_record(file_hash="hash-b", run_id="run-2"))
+def test_changed_content_appends_a_new_version_and_mutates_nothing(store):
+    """The landing zone is append-only: an amendment is a second row, and the
+    original row survives byte-for-byte."""
+    store.record_version(make_record(file_hash="hash-a"))
+    original = store.landing.find_one({"file_hash": "hash-a"})
+
+    outcome = store.record_version(make_record(file_hash="hash-b", run_id="run-2"))
 
     assert outcome == "updated"
-    assert store.landing.count_documents({}) == 1
+    assert store.landing.count_documents({}) == 2  # both versions retained
 
-    stored = store.landing.find_one({"identifier": "ADJ-00054658"})
-    assert stored["file_hash"] == "hash-b"
-    assert stored["content_changed_at"] is not None
+    still_original = store.landing.find_one({"file_hash": "hash-a"})
+    assert still_original["storage_path"] == original["storage_path"]
+    assert still_original["run_id"] == original["run_id"]
+    assert still_original.get("content_changed_at") is None
 
-
-def test_first_seen_at_survives_later_runs(store):
-    """Audit trail must record when we *first* saw a document, not the last run."""
-    store.upsert_landing(make_record())
-    original = store.landing.find_one({})["first_seen_at"]
-
-    store.upsert_landing(make_record(file_hash="hash-b", run_id="run-2"))
-    assert store.landing.find_one({})["first_seen_at"] == original
+    amended = store.landing.find_one({"file_hash": "hash-b"})
+    assert amended["content_changed_at"] is not None
 
 
-def test_known_hash_index_is_keyed_by_identifier_and_body(store):
-    store.upsert_landing(make_record())
+def test_latest_hash_wins_in_the_idempotency_index(store):
+    """After an amendment, the known-hash index must answer with the NEW hash,
+    or the next run would re-land the amendment forever."""
+    store.record_version(make_record(file_hash="hash-a"))
+    store.record_version(make_record(file_hash="hash-b", run_id="run-2"))
+
     index = store.load_known_hashes(date(2025, 7, 1), date(2025, 7, 31))
-
-    assert index[("ADJ-00054658", "Workplace Relations Commission")] == "hash-a"
+    assert index[("ADJ-00054658", "Workplace Relations Commission")] == "hash-b"
 
 
 def test_known_hash_index_respects_the_date_window(store):
     """A partition outside the requested window must not be preloaded."""
-    store.upsert_landing(make_record())
+    store.record_version(make_record())
     index = store.load_known_hashes(date(2024, 1, 1), date(2024, 12, 31))
     assert index == {}
 
@@ -91,19 +100,19 @@ def test_identifier_normalisation_prevents_duplicate_rows(store):
     spaced = make_record()
     spaced_dict = spaced.model_dump()
     spaced_dict["identifier"] = "IR - SC - 00001595"
-    store.upsert_landing(DecisionRecord(**spaced_dict))
+    store.record_version(DecisionRecord(**spaced_dict))
 
     tight = spaced.model_dump()
     tight["identifier"] = "IR-SC-00001595"
-    outcome = store.upsert_landing(DecisionRecord(**tight))
+    outcome = store.record_version(DecisionRecord(**tight))
 
     assert outcome == "unchanged"
     assert store.landing.count_documents({}) == 1
 
 
 def test_touch_updates_audit_without_touching_content(store):
-    """Landing data is immutable; only the audit trail may change on a re-run."""
-    store.upsert_landing(make_record())
+    """Only the audit trail (last_seen_*) may change on a re-run."""
+    store.record_version(make_record())
     before = store.landing.find_one({})
 
     store.touch_last_seen("ADJ-00054658", "Workplace Relations Commission", "run-9")
@@ -111,15 +120,29 @@ def test_touch_updates_audit_without_touching_content(store):
 
     assert after["file_hash"] == before["file_hash"]
     assert after["storage_path"] == before["storage_path"]
+    assert after["run_id"] == before["run_id"]
     assert after["last_seen_run_id"] == "run-9"
 
 
-def test_storage_key_is_deterministic():
-    """Same record, same key -- a re-run overwrites rather than accumulating."""
+def test_iter_latest_landing_returns_one_doc_per_record(store):
+    """The transform must see the latest version only -- never both."""
+    store.record_version(make_record(file_hash="hash-a"))
+    store.record_version(make_record(file_hash="hash-b", run_id="run-2"))
+
+    docs = list(store.iter_latest_landing(date(2025, 7, 1), date(2025, 7, 31)))
+    assert len(docs) == 1
+    assert docs[0]["file_hash"] == "hash-b"
+    assert store.count_latest_landing(date(2025, 7, 1), date(2025, 7, 31)) == 1
+
+
+def test_storage_key_is_deterministic_per_version():
+    """Same content, same key -- an unchanged re-run resolves to the identical
+    object; changed content resolves to a DIFFERENT key, never an overwrite."""
     assert make_record().storage_key() == make_record(run_id="other").storage_key()
+    assert make_record().storage_key() != make_record(file_hash="hash-b").storage_key()
 
 
-def test_storage_key_is_partitioned_and_extensioned():
-    key = make_record().storage_key()
-    assert key.startswith("workplace-relations-commission/2025-07-01/")
-    assert key.endswith("ADJ-00054658.html")
+def test_storage_key_is_partitioned_versioned_and_extensioned():
+    key = make_record(file_hash="a" * 64).storage_key()
+    assert key.startswith("workplace-relations-commission/2025-07-01/ADJ-00054658/")
+    assert key.endswith(f"{'a' * 16}.html")

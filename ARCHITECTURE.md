@@ -15,47 +15,49 @@ like the Labour Court's, quarterly for a sparse body like the EAT.
 
 ## Retries and rate limiting
 
-Three layers: **per-request retries** (Scrapy, 4 attempts on 429/5xx/timeout,
-Retry-After honoured); **adaptive throttling** (AutoThrottle targets a
-concurrency level by measuring actual server latency, widening the delay when
-the site slows and narrowing it when it recovers — faster and gentler than a
-fixed `sleep()`); **per-partition retries** (Dagster, 2 attempts, 60s delay)
-for failures the crawler can't recover from in-process.
+Three layers: **per-request retries** (Scrapy, up to 4 retries after the
+initial attempt, on 429/5xx/timeout; retries are deprioritised, and backoff
+comes from AutoThrottle — Scrapy's retry middleware does not read Retry-After);
+**adaptive throttling** (AutoThrottle widens the delay for every request as
+soon as the server slows or errors, and narrows it when it recovers — faster
+and gentler than a fixed `sleep()`); **per-partition retries** (Dagster, 2
+attempts, 60s delay) for failures the crawler can't recover from in-process.
 
 We identify the crawler honestly (User-Agent + contact address), obey
-`robots.txt`, and cap per-domain concurrency. This isn't just correctness —
-the output feeds a legal product, and a corpus whose provenance can't survive
-a client's due diligence is worthless. Bulk access beyond politeness limits
-should be a licensed agreement, not an engineering workaround.
+`robots.txt`, and cap per-domain concurrency — the output feeds a legal
+product, and a corpus whose provenance can't survive due diligence is
+worthless.
 
-## Deduplication strategy
+## Deduplication and immutability
 
-SHA-256 of stored bytes, enforced at three levels: a **unique index** on
-`(identifier, body)` makes duplicate prevention a database guarantee, not an
-app convention — even racing workers can't produce two rows (identifiers are
-normalised first, since the site formats them inconsistently across pages).
-**Content comparison** before every write — unchanged skips the S3 PUT and
-Mongo rewrite entirely, just touches `last_seen_at`; changed updates in place
-and stamps `content_changed_at`, giving free amendment history. **Deterministic
-object keys** (no timestamp/run-id) mean a re-run overwrites, never
-accumulates.
+The landing zone is **append-only and hash-versioned**: one Mongo row and one
+object per distinct content version, keyed `(source, identifier, body,
+file_hash)` under a **unique index** (identifiers normalised first — the site
+formats them inconsistently). Object keys embed the content hash, so nothing
+is ever overwritten; an amended decision lands as a *new* version beside the
+old one (free amendment history), and the previous version is never mutated —
+satisfying "don't update/delete Landing Zone data" literally.
 
-We dedupe on hash, not URL (unstable, tracking params) or ETag (this source
-doesn't set it reliably). Honest limitation: we only detect "unchanged" after
-downloading — the saving is on the write path and downstream reprocessing, not
-bandwidth. True request-avoidance would need conditional requests this source
-doesn't support.
-
-The idempotency index loads **once per run** as a single indexed range query,
-not per-record — a per-record Mongo call would block Twisted's single-threaded
-reactor and stall every in-flight download.
+Idempotency operates at the **network level**: known `(identifier, body)`
+pairs are skipped at *listing* time, before their detail page or document is
+requested — a second run of the same window re-downloads nothing
+(`SCRAPE_RECHECK_KNOWN=true` flips to re-fetch-and-hash-compare for a
+scheduled amendment sweep; ETag/If-Modified-Since would be preferable but this
+source doesn't serve them dependably). The known-hash index loads **once per
+run** as one range query — a per-record Mongo call would block Twisted's
+reactor. Every run ends with a per-`(body, partition)` **reconciliation
+ledger** (source-reported vs discovered vs succeeded/skipped/failed, status
+complete|partial|failed) that drives the process exit code — a failed
+partition can never report green.
 
 ## Scaling to 50+ sources
 
 Already structured for this: all site-specific logic lives behind one
-`SearchAdapter` protocol (`search_adapter.py`); partitioning, hashing,
-idempotency, storage and orchestration are source-agnostic. Adding a source
-means one new adapter, not pipeline edits.
+`SearchAdapter` protocol with a **source registry** (`SOURCE_ADAPTERS`,
+selected by `SCRAPE_SOURCE`), and every record carries a `source` field in its
+natural key. Adding a source means registering one adapter, not pipeline
+edits. The transform streams Mongo in **bounded batches** (configurable), so
+memory is flat at any corpus size.
 
 What changes at that scale: **config becomes data** — a declarative per-source
 registry (URL, adapter, rate limits, robots policy, legal basis) that the

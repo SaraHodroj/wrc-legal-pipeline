@@ -24,7 +24,7 @@ python -m venv .venv && source .venv/bin/activate
 make install     # pip install -e ".[dev]"
 
 # 4. Verify offline
-make test        # 111 tests, no infrastructure required
+make test        # 122 tests, no infrastructure required
 
 # 5. Verify the live site still matches the adapter (2 polite GETs, no infra)
 make check-site  # or: python scripts/check_site_contract.py
@@ -83,7 +83,7 @@ contact address.
 ┌────────────────────┐                    ┌────────────────────┐
 │ MinIO landing-zone │                    │ Mongo landing_     │
 │ {body}/{partition}/│◄──storage_path─────│ decisions          │
-│ {identifier}.{ext} │                    │ + file_hash        │
+│ {id}/{hash}.{ext}  │                    │ + hash (versioned) │
 └─────────┬──────────┘                    └─────────┬──────────┘
           │              IMMUTABLE — never modified │
           ▼                                         ▼
@@ -131,7 +131,7 @@ src/wrc_pipeline/
 | 6 | Documents in object storage; PDFs as-is, HTML pages as `.html` | `spiders/decisions.py::parse_detail`, `storage/object_store.py` |
 | 7 | `storage_path` on the metadata record | `pipelines.PersistencePipeline._store` |
 | 8 | `file_hash` on the metadata record | `hashing.py`, `models.py` |
-| 9 | Idempotent re-runs, hash-based change detection | `metadata_store.upsert_landing`, `tests/test_idempotency.py` |
+| 9 | Idempotent re-runs (no re-download), hash-based change detection | `metadata_store.record_version`, `tests/test_idempotency.py` |
 | 10 | Structured JSON logs + end-of-run summary | `logging_setup.py`, `models.RunStats` |
 | — | Dockerised storages | `docker-compose.yml` |
 | — | Orchestration with dependencies | `orchestration/definitions.py` (Dagster) |
@@ -154,32 +154,41 @@ jq 'select(.event == "run_summary")' run.jsonl               # found vs scraped,
 ```
 
 The summary line reports `records_found`, `records_scraped`, `records_new`,
-`records_updated`, `records_skipped_unchanged`, `downloads_failed`,
-`bytes_downloaded` and `success_rate`. Failures are also persisted to the
+`records_updated`, `records_skipped_unchanged`, `records_skipped_known`, `downloads_failed`,
+`storage_failures`, `bytes_downloaded`, `success_rate`, `run_status` and a
+per-(body, partition) `partition_reconciliation` ledger. Failures are also persisted to the
 `failed_records` collection so a partial batch can be replayed without
 re-crawling the search pages.
 
 ---
 
-## Idempotency
+## Idempotency and immutability
 
-Running the same window twice writes nothing the second time:
+Running the same window twice downloads nothing and writes nothing the second
+time -- known records are skipped at *listing* time, before their pages are
+requested:
 
 ```bash
 make ingest START=2024-01-01 END=2024-02-01
-make ingest START=2024-01-01 END=2024-02-01   # records_skipped_unchanged == records_found
+make ingest START=2024-01-01 END=2024-02-01   # records_skipped_known == records_found
 ```
 
-Guaranteed by a unique index on `(identifier, body)`, SHA-256 content
-comparison before every write, and deterministic object keys. See
-`ARCHITECTURE.md` for the full strategy and its limitations.
+The landing zone is **append-only and hash-versioned**: an amended decision
+lands as a new version row and a new object key beside the old one -- stored
+landing data is never updated or deleted. Set `SCRAPE_RECHECK_KNOWN=true` to
+re-fetch known records and hash-compare them (the scheduled amendment sweep).
+
+Every run ends with a per-(body, partition) reconciliation ledger in the
+`run_summary` line, and the exit code reflects it: `0` all partitions
+complete, `3` partial (every missing record logged and attributed), `1`
+failed. See `ARCHITECTURE.md` for the full strategy.
 
 ---
 
 ## Testing
 
 ```bash
-make test    # 111 tests across every module: partitioning boundaries, hashing,
+make test    # 122 tests across every module: partitioning boundaries, hashing,
              # HTML extraction, idempotency, search-adapter parsing, spider
              # callbacks, persistence pipeline, transform job, logging, CLI,
              # and a Dagster definitions smoke test. ~83% line coverage.

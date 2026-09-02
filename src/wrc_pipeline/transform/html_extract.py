@@ -29,15 +29,23 @@ CHROME_PATTERNS = (
     "cookie", "banner", "breadcrumb", "skip-link", "site-header", "site-footer",
     "social", "share", "navigation", "menu", "sidebar", "search-form",
     "back-to-top", "print-page", "my-documents", "binder",
+    "return-to-search", "returntosearch", "language-toggle", "font-size",
 )
+
+#: Link texts that are navigation, not decision content, wherever they appear.
+CHROME_LINK_TEXTS = ("return to search", "back to search")
 
 #: Below this many characters of text we assume extraction matched an empty
 #: wrapper rather than the decision, and keep looking. Shared by the selector
 #: path and the density fallback so the two cannot drift apart.
 MIN_CONTENT_LENGTH = 200
 
-#: Ordered candidates for the container holding the decision itself.
+#: Ordered candidates for the container holding the decision itself. The
+#: site's real decision container (``div.content``, verified against a live
+#: page) comes before the generic fallbacks so a match is tight, not a
+#: whole-page wrapper.
 CONTENT_SELECTORS = (
+    "div.content",
     "main#main",
     "main",
     "div.case-content",
@@ -81,6 +89,16 @@ def extract_main_content(html: str, *, min_length: int = MIN_CONTENT_LENGTH) -> 
             continue
         if _is_chrome(element):
             element.decompose()
+
+    # Navigation links identified by their text ("Return to Search") -- on the
+    # live site they carry no usable class, so class-based stripping misses
+    # them (verified against a real decision page in review).
+    for anchor in soup.find_all("a"):
+        if getattr(anchor, "decomposed", False):
+            continue
+        label = anchor.get_text(strip=True).lower()
+        if label in CHROME_LINK_TEXTS:
+            anchor.decompose()
 
     for selector in CONTENT_SELECTORS:
         container = soup.select_one(selector)
@@ -140,11 +158,19 @@ def _densest_block(soup: BeautifulSoup, min_length: int = MIN_CONTENT_LENGTH) ->
 
 
 def _tidy(container: Tag) -> str:
-    """Collapse redundant whitespace without disturbing the markup."""
+    """Collapse redundant whitespace without disturbing the markup.
+
+    Boundary whitespace is *preserved as a single space*, not stripped: the
+    text node after ``<b>Reference:</b>`` begins with a space that separates
+    the label from the value, and dropping it fuses them into
+    ``Reference:ADJ-...`` (caught against a real page in review).
+    """
     for element in container.find_all(string=True):
         if element.strip() == "":
             continue
-        replacement = " ".join(element.split())
+        lead = " " if element[:1].isspace() else ""
+        trail = " " if element[-1:].isspace() else ""
+        replacement = f"{lead}{' '.join(element.split())}{trail}"
         if replacement != element:
             element.replace_with(replacement)
     return str(container)

@@ -37,17 +37,28 @@ AUTOTHROTTLE_DEBUG = False
 
 # --- Reliability ------------------------------------------------------------
 RETRY_ENABLED = True
+# Scrapy semantics: RETRY_TIMES counts retries AFTER the initial attempt, so
+# 4 here means up to 5 total attempts per request.
 RETRY_TIMES = _s.scrape.retry_times
 RETRY_HTTP_CODES = list(_s.scrape.retry_http_codes)
 DOWNLOAD_TIMEOUT = _s.scrape.download_timeout_seconds
 
-# Honour Retry-After on 429/503 instead of hammering a server that has just
-# told us, explicitly, to wait.
+# Retries are DEPRIORITISED, not delayed: Scrapy's RetryMiddleware does not
+# read the Retry-After header. The effective backoff comes from AutoThrottle,
+# which widens the delay for every request as soon as the server slows down or
+# errors -- honest description, since claiming Retry-After support here would
+# be wrong.
 RETRY_PRIORITY_ADJUST = -1
 
-# HTTP caching makes re-runs during development nearly free and takes real load
-# off the source while iterating on selectors.
-HTTPCACHE_ENABLED = False
+# Detail pages are HTML; documents can be many MB. Cap the in-memory response
+# size so one pathological file cannot exhaust the worker. Configurable, like
+# every other tunable.
+DOWNLOAD_MAXSIZE = _s.scrape.download_maxsize_bytes
+DOWNLOAD_WARNSIZE = _s.scrape.download_warnsize_bytes
+
+# Development convenience, off by default: cache responses on disk so selector
+# iteration doesn't re-hit the source. Enable with SCRAPE_HTTPCACHE_ENABLED=true.
+HTTPCACHE_ENABLED = _s.scrape.httpcache_enabled
 HTTPCACHE_EXPIRATION_SECS = 86400
 HTTPCACHE_DIR = "httpcache"
 HTTPCACHE_IGNORE_HTTP_CODES = [429, 500, 502, 503, 504]

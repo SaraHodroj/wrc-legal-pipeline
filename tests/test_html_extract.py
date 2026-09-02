@@ -95,3 +95,36 @@ def test_identifier_normalisation_collapses_unicode_dashes():
         run_id="t",
     )
     assert record.identifier == "IR-SC-00001494"
+
+
+def test_return_to_search_navigation_is_stripped():
+    """Review regression: the live page's 'Return to Search' link carries no
+    class, so class-based chrome stripping missed it."""
+    from wrc_pipeline.transform.html_extract import extract_main_content
+
+    body = "The complaint is well founded. " * 20
+    html = f"""
+    <html><body><div class="content">
+      <a href="/en/search/?advance=true">Return to Search</a>
+      <h1>ADJ-00000001</h1><p>{body}</p>
+    </div></body></html>
+    """
+    result = extract_main_content(html)
+    assert "Return to Search" not in result
+    assert "well founded" in result
+
+
+def test_inline_tag_boundary_whitespace_is_preserved():
+    """Review regression: collapsing whitespace stripped the space after
+    '<b>Reference:</b>', fusing label and value into 'Reference:ADJ-...'."""
+    from wrc_pipeline.transform.html_extract import extract_main_content, extract_plain_text
+
+    body = "Filler decision text to clear the minimum length. " * 10
+    html = f"""
+    <html><body><div class="content">
+      <p><b>Adjudication Reference:</b> ADJ-00045701</p><p>{body}</p>
+    </div></body></html>
+    """
+    text = extract_plain_text(extract_main_content(html))
+    assert "Reference: ADJ-00045701" in text
+    assert "Reference:ADJ" not in text

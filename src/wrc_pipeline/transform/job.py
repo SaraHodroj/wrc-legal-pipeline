@@ -47,7 +47,8 @@ def transform_window(start: date, end: date, run_id: str | None = None) -> dict[
     objects.ensure_bucket(settings.object_store.curated_bucket)
     metadata.ensure_indexes()
 
-    records = metadata.fetch_landing_between(start, end)
+    batch_size = settings.transform.batch_size
+    records_found = metadata.count_latest_landing(start, end)
     logger.info(
         "Transform starting",
         extra={
@@ -55,28 +56,35 @@ def transform_window(start: date, end: date, run_id: str | None = None) -> dict[
             "run_id": run_id,
             "start_date": start,
             "end_date": end,
-            "records_found": len(records),
+            "records_found": records_found,
+            "batch_size": batch_size,
         },
     )
 
-    curated: list[dict[str, Any]] = []
     stats = {
-        "records_found": len(records),
+        "records_found": records_found,
         "transformed": 0,
         "passthrough": 0,
         "skipped_unchanged": 0,
         "failed": 0,
     }
     failures: list[dict[str, Any]] = []
+    written = 0
+    batch: list[dict[str, Any]] = []
+    curated_index = metadata.load_curated_hashes(start, end)
 
-    for doc in records:
+    # Streamed, not materialised: documents arrive from Mongo in bounded
+    # batches (latest version per record only) and curated rows are flushed in
+    # bounded batches -- memory stays flat whether the window holds 900
+    # documents or 900,000.
+    for doc in metadata.iter_latest_landing(start, end, batch_size=batch_size):
         identifier = doc.get("identifier", "<unknown>")
         try:
-            result = _transform_one(doc, objects, settings, run_id)
+            result = _transform_one(doc, objects, settings, run_id, curated_index)
             if result is None:
                 stats["skipped_unchanged"] += 1
                 continue
-            curated.append(result)
+            batch.append(result)
             if result["document_type"] in PASSTHROUGH_TYPES:
                 stats["passthrough"] += 1
             else:
@@ -93,8 +101,12 @@ def transform_window(start: date, end: date, run_id: str | None = None) -> dict[
                 "Transform failed for record",
                 extra={"event": "transform_record_failed", "run_id": run_id, **entry},
             )
+        if len(batch) >= batch_size:
+            written += metadata.bulk_upsert_curated(batch)
+            batch = []
 
-    written = metadata.bulk_upsert_curated(curated)
+    if batch:
+        written += metadata.bulk_upsert_curated(batch)
     metadata.close()
 
     summary = {
@@ -109,7 +121,11 @@ def transform_window(start: date, end: date, run_id: str | None = None) -> dict[
 
 
 def _transform_one(
-    doc: dict[str, Any], objects: ObjectStore, settings: Any, run_id: str
+    doc: dict[str, Any],
+    objects: ObjectStore,
+    settings: Any,
+    run_id: str,
+    curated_index: dict[tuple[str, str], str | None],
 ) -> dict[str, Any] | None:
     """Transform a single landing record. Returns ``None`` if already current."""
     storage_path = doc.get("storage_path")
@@ -155,24 +171,35 @@ def _transform_one(
     # were observed, not pre-emptively.
     new_key = f"{identifier}.{extension}"
 
-    # Idempotency, again by hash: if the curated object is already present with
-    # this exact content, re-uploading it is pure waste.
+    # Idempotency, by hash -- but object idempotency and METADATA idempotency
+    # are separate questions. An existing, identical curated object only lets
+    # us skip the PUT; the metadata row is still emitted and upserted, so a
+    # run that crashed between "object uploaded" and "Mongo written" repairs
+    # itself on the next pass instead of leaving a permanent gap.
     curated_bucket = settings.object_store.curated_bucket
+    object_current = False
     if objects.exists(curated_bucket, new_key):
         existing = objects.get_bytes(curated_bucket, new_key)
-        if hash_bytes(existing) == new_hash:
-            return None
+        object_current = hash_bytes(existing) == new_hash
 
-    new_uri = objects.put_bytes(
-        bucket=curated_bucket,
-        key=new_key,
-        data=new_payload,
-        content_type=_content_type_for(extension),
-        metadata={"identifier": identifier, "file-hash": new_hash, "run-id": run_id},
-    )
+    metadata_current = curated_index.get((identifier, doc["body"])) == new_hash
+    if object_current and metadata_current:
+        return None  # both halves verified current -- nothing to do
+
+    if object_current:
+        new_uri = f"s3://{curated_bucket}/{new_key}"
+    else:
+        new_uri = objects.put_bytes(
+            bucket=curated_bucket,
+            key=new_key,
+            data=new_payload,
+            content_type=_content_type_for(extension),
+            metadata={"identifier": identifier, "file-hash": new_hash, "run-id": run_id},
+        )
 
     return {
         "identifier": identifier,
+        "source": doc.get("source", "wrc"),
         "body": doc["body"],
         "title": doc.get("title"),
         "description": doc.get("description"),

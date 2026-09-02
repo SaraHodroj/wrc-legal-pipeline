@@ -255,3 +255,40 @@ def test_unknown_body_in_env_var_fails_at_startup_not_mid_crawl(tmp_path, monkey
 
     with pytest.raises(ValidationError, match="Unknown body"):
         ScrapeSettings(_env_file=str(env_file))  # type: ignore[call-arg]
+
+
+def test_daily_schedule_targets_the_current_month_partition():
+    """Review regression: a bare ScheduleDefinition on a partitioned job emits
+    a RunRequest with no partition_key and cannot refresh the current month.
+    The schedule must resolve the month the tick falls in."""
+    from datetime import UTC, datetime
+
+    from dagster import RunRequest, build_schedule_context
+
+    from wrc_pipeline.orchestration.definitions import daily_refresh
+
+    context = build_schedule_context(
+        scheduled_execution_time=datetime(2024, 3, 15, 2, 0, tzinfo=UTC)
+    )
+    request = daily_refresh(context)
+    assert isinstance(request, RunRequest)
+    assert request.partition_key == "2024-03-01"
+
+
+def test_partial_transform_fails_the_curated_materialization(monkeypatch):
+    """A month with failed transforms must not present as a healthy asset."""
+    import pytest as _pytest
+
+    from wrc_pipeline.orchestration import definitions as defs_mod
+
+    monkeypatch.setattr(
+        defs_mod,
+        "transform_window",
+        lambda **_kwargs: {"failed": 3, "transformed": 7},
+    )
+
+    from dagster import build_asset_context
+
+    context = build_asset_context(partition_key="2024-03-01")
+    with _pytest.raises(RuntimeError, match="3 record"):
+        defs_mod.curated_decisions(context)

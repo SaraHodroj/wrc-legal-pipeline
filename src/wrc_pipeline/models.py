@@ -47,12 +47,36 @@ class DocumentType(StrEnum):
         return cls.UNKNOWN
 
 
+def normalise_identifier(value: str) -> str:
+    """Normalise so 'IR - SC - 00001595' and 'IR-SC-00001595' are one record.
+
+    The listing page and the detail page format identifiers differently on
+    this site; without normalisation the same decision would be stored twice
+    and idempotency would silently fail. A few live slugs also use unicode
+    dashes (en/em dash), which must collapse to the same record as their
+    ASCII-hyphen siblings. Exposed as a module function because the spider
+    needs the same normalisation *before* a record is built, to match listing
+    rows against already-ingested identifiers.
+    """
+    for dash in ("–", "—", "−"):  # en dash, em dash, minus
+        value = value.replace(dash, "-")
+    collapsed = "-".join(part.strip() for part in value.split("-"))
+    return " ".join(collapsed.split()).upper()
+
+
 class DecisionRecord(BaseModel):
-    """One decision/determination as stored in the landing metadata collection."""
+    """One landed *version* of a decision/determination.
+
+    The landing zone is append-only: a record whose content changes upstream
+    is stored as a NEW version row (and a new object under a hash-suffixed
+    key), never by mutating the previous one. The version identity is
+    ``(source, identifier, body, file_hash)``.
+    """
 
     model_config = ConfigDict(use_enum_values=True, extra="forbid")
 
     # --- Natural key --------------------------------------------------------
+    source: str = Field("wrc", description="Which legal source this came from")
     identifier: str = Field(..., description="e.g. ADJ-00054658 -- unique per decision")
     body: str = Field(..., description="Issuing body, e.g. 'Labour Court'")
 
@@ -81,29 +105,24 @@ class DecisionRecord(BaseModel):
     @field_validator("identifier")
     @classmethod
     def _normalise_identifier(cls, value: str) -> str:
-        """Normalise so 'IR - SC - 00001595' and 'IR-SC-00001595' are one record.
-
-        The listing page and the detail page format identifiers differently on
-        this site; without normalisation the same decision would be stored
-        twice and idempotency would silently fail. A few live slugs also use
-        unicode dashes (en/em dash), which must collapse to the same record
-        as their ASCII-hyphen siblings.
-        """
-        for dash in ("–", "—", "−"):  # en dash, em dash, minus
-            value = value.replace(dash, "-")
-        collapsed = "-".join(part.strip() for part in value.split("-"))
-        return " ".join(collapsed.split()).upper()
+        return normalise_identifier(value)
 
     def storage_key(self) -> str:
-        """Deterministic object key for the landing zone.
+        """Deterministic, *versioned* object key for the landing zone.
 
-        Partition-prefixed so the bucket stays browsable and lifecycle rules
-        can be applied per period. Deterministic so a re-run overwrites in
-        place rather than accumulating duplicates under new names.
+        The content hash is part of the key, so changed content lands under a
+        new key and an unchanged re-run resolves to the same key -- the landing
+        bucket is therefore append-only (no overwrites) while re-runs stay
+        idempotent. Partition-prefixed so the bucket stays browsable and
+        lifecycle rules can be applied per period.
         """
         ext = str(self.document_type)
         safe_body = self.body.lower().replace(" ", "-")
-        return f"{safe_body}/{self.partition_date.isoformat()}/{self.identifier}.{ext}"
+        version = (self.file_hash or "unhashed")[:16]
+        return (
+            f"{safe_body}/{self.partition_date.isoformat()}/"
+            f"{self.identifier}/{version}.{ext}"
+        )
 
 
 class FailedRecord(BaseModel):
@@ -126,6 +145,60 @@ class FailedRecord(BaseModel):
     failed_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
+class PartitionStats(BaseModel):
+    """Reconciliation ledger for one ``(body, partition)`` unit of work.
+
+    The brief demands that a partition holding N records yields N, or N-X with
+    every one of the X attributable. That is only checkable if we track, per
+    partition: what the source *says* it has, what we discovered in listings,
+    and how each discovered record ended (stored, skipped-as-known, or failed).
+    ``status`` is derived, never asserted.
+    """
+
+    body: str
+    partition: str
+    source_reported: int | None = None
+    rows_discovered: int = 0
+    records_succeeded: int = 0
+    records_skipped_known: int = 0
+    records_failed: int = 0
+    pages_fetched: int = 0
+    page_cap_hit: bool = False
+    search_failed: bool = False
+
+    @property
+    def unaccounted(self) -> int:
+        return self.rows_discovered - (
+            self.records_succeeded + self.records_skipped_known + self.records_failed
+        )
+
+    @property
+    def status(self) -> str:
+        """complete | partial | failed -- derived from the ledger."""
+        if self.search_failed or (
+            self.rows_discovered == 0 and (self.source_reported or 0) > 0
+        ):
+            return "failed"
+        if self.records_failed > 0 or self.unaccounted > 0 or self.page_cap_hit:
+            return "partial"
+        return "complete"
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "body": self.body,
+            "partition": self.partition,
+            "source_reported": self.source_reported,
+            "rows_discovered": self.rows_discovered,
+            "records_succeeded": self.records_succeeded,
+            "records_skipped_known": self.records_skipped_known,
+            "records_failed": self.records_failed,
+            "unaccounted": self.unaccounted,
+            "pages_fetched": self.pages_fetched,
+            "page_cap_hit": self.page_cap_hit,
+            "status": self.status,
+        }
+
+
 class RunStats(BaseModel):
     """Per-run counters, emitted as the end-of-run summary log line."""
 
@@ -133,38 +206,72 @@ class RunStats(BaseModel):
     started_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     finished_at: datetime | None = None
 
-    partitions_processed: int = 0
+    partitions_planned: int = 0
     records_found: int = 0
     records_scraped: int = 0
     records_skipped_unchanged: int = 0
+    records_skipped_known: int = 0
     records_updated: int = 0
     records_new: int = 0
     downloads_failed: int = 0
+    storage_failures: int = 0
     bytes_downloaded: int = 0
 
     failures: list[dict[str, Any]] = Field(default_factory=list)
+    partitions: dict[str, PartitionStats] = Field(default_factory=dict)
+
+    def partition(self, body: str, partition_key: str) -> PartitionStats:
+        """The reconciliation ledger for one (body, partition), created lazily."""
+        key = f"{body}|{partition_key}"
+        if key not in self.partitions:
+            self.partitions[key] = PartitionStats(body=body, partition=partition_key)
+        return self.partitions[key]
+
+    @property
+    def run_status(self) -> str:
+        """complete | partial | failed -- worst partition wins."""
+        statuses = {p.status for p in self.partitions.values()}
+        if not statuses:
+            return "failed"  # nothing was even attempted
+        if "failed" in statuses:
+            return "failed"
+        if "partial" in statuses:
+            return "partial"
+        return "complete"
 
     @property
     def success_rate(self) -> float:
+        """Honest even at zero: an empty run with failures is 0.0, not 1.0."""
         if not self.records_found:
-            return 1.0
-        return round(self.records_scraped / self.records_found, 4)
+            return 0.0 if (self.downloads_failed or self.storage_failures) else 1.0
+        return round(
+            (self.records_scraped + self.records_skipped_known) / self.records_found, 4
+        )
 
     def summary(self) -> dict[str, Any]:
         """Flat dict for the final structured log line."""
         return {
             "event": "run_summary",
             "run_id": self.run_id,
+            "run_status": self.run_status,
             "started_at": self.started_at,
             "finished_at": self.finished_at or datetime.now(UTC),
-            "partitions_processed": self.partitions_processed,
+            "partitions_planned": self.partitions_planned,
+            "partitions_complete": sum(
+                1 for p in self.partitions.values() if p.status == "complete"
+            ),
             "records_found": self.records_found,
             "records_scraped": self.records_scraped,
             "records_new": self.records_new,
             "records_updated": self.records_updated,
             "records_skipped_unchanged": self.records_skipped_unchanged,
+            "records_skipped_known": self.records_skipped_known,
             "downloads_failed": self.downloads_failed,
+            "storage_failures": self.storage_failures,
             "bytes_downloaded": self.bytes_downloaded,
             "success_rate": self.success_rate,
+            "partition_reconciliation": [
+                p.as_dict() for p in self.partitions.values()
+            ],
             "failure_sample": self.failures[:25],
         }

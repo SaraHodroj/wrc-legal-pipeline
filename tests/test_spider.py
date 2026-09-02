@@ -376,3 +376,83 @@ def test_blank_row_description_is_backfilled_from_the_detail_page(spider):
     stores = [r for r in results if isinstance(r, dict) and r.get("__action__") == "store"]
     assert len(stores) == 1
     assert stores[0]["record"].description == "Declan Holden V Ger Brennan Construction"
+
+
+# --------------------------------------------------------------------------
+# Review regressions: network-level idempotency and honest reconciliation.
+# --------------------------------------------------------------------------
+def test_known_records_are_skipped_before_any_download(spider):
+    """"Running it twice must not re-download unchanged files": a record whose
+    (identifier, body) is already landed is skipped at LISTING time -- no
+    detail request, no document request, only an audit touch."""
+    spider.known_hashes = {("ADJ-00054658", "Workplace Relations Commission"): "hash-a"}
+    resp = response("https://example.ie/en/search/?p=1", SEARCH_PAGE)
+
+    results = list(spider.parse_search(resp, "Workplace Relations Commission", PARTITION, 1))
+
+    detail_requests = [r for r in results if hasattr(r, "url") and "/en/cases/" in r.url]
+    touches = [r for r in results if isinstance(r, dict) and r.get("__action__") == "touch"]
+    assert detail_requests == []
+    assert len(touches) == 1
+    assert spider.stats_model.records_skipped_known == 1
+
+
+def test_recheck_known_flag_refetches_for_amendment_detection(spider):
+    """With SCRAPE_RECHECK_KNOWN=true the same known record IS re-fetched, so
+    hash comparison can catch silently amended decisions."""
+    spider.recheck_known = True
+    spider.known_hashes = {("ADJ-00054658", "Workplace Relations Commission"): "hash-a"}
+    resp = response("https://example.ie/en/search/?p=1", SEARCH_PAGE)
+
+    results = list(spider.parse_search(resp, "Workplace Relations Commission", PARTITION, 1))
+    detail_requests = [r for r in results if hasattr(r, "url") and "/en/cases/" in r.url]
+    assert len(detail_requests) == 1
+
+
+def test_partition_ledger_reconciles_complete_partition(spider):
+    resp = response("https://example.ie/en/search/?p=1", SEARCH_PAGE)
+    list(spider.parse_search(resp, "Workplace Relations Commission", PARTITION, 1))
+    ledger = spider.stats_model.partition("Workplace Relations Commission", PARTITION.key)
+    ledger.records_succeeded += 1  # what the pipeline would report
+
+    snapshot = ledger.as_dict()
+    assert snapshot["source_reported"] == 1
+    assert snapshot["rows_discovered"] == 1
+    assert snapshot["unaccounted"] == 0
+    assert snapshot["status"] == "complete"
+
+
+def test_failed_search_marks_partition_failed_not_green():
+    """A partition whose search never returned must surface as failed."""
+    from wrc_pipeline.models import RunStats
+
+    stats = RunStats(run_id="t")
+    ledger = stats.partition("Labour Court", "2024-01-01")
+    ledger.search_failed = True
+    assert ledger.status == "failed"
+    assert stats.run_status == "failed"
+
+
+def test_success_rate_is_zero_when_nothing_found_but_requests_failed():
+    """The old metric reported 100% success for a run in which every search
+    request failed; an empty-but-failing run must be 0.0."""
+    from wrc_pipeline.models import RunStats
+
+    stats = RunStats(run_id="t")
+    stats.downloads_failed = 4
+    assert stats.success_rate == 0.0
+    assert stats.run_status == "failed"  # no partition ever completed
+
+
+def test_partial_status_when_some_records_fail():
+    from wrc_pipeline.models import RunStats
+
+    stats = RunStats(run_id="t")
+    ledger = stats.partition("Labour Court", "2024-01-01")
+    ledger.source_reported = 10
+    ledger.rows_discovered = 10
+    ledger.records_succeeded = 8
+    ledger.records_failed = 2
+    assert ledger.unaccounted == 0
+    assert ledger.status == "partial"
+    assert stats.run_status == "partial"

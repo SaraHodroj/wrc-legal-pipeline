@@ -43,9 +43,11 @@ from dagster import (
     Definitions,
     MonthlyPartitionsDefinition,
     RetryPolicy,
-    ScheduleDefinition,
+    RunRequest,
+    ScheduleEvaluationContext,
     asset,
     define_asset_job,
+    schedule,
 )
 
 from ..config import get_settings
@@ -109,11 +111,16 @@ def landing_decisions(context: AssetExecutionContext) -> dict:
     # the structured records are not lost behind a process boundary.
     for line in completed.stdout.splitlines():
         context.log.info(line)
+    # Runner exit codes: 0 complete, 3 partial (every miss logged/attributed),
+    # anything else failed. Partial and failed both fail the materialization --
+    # an asset that silently accepted missing records would defeat the ledger.
     if completed.returncode != 0:
         context.log.error(completed.stderr)
+        label = "partial" if completed.returncode == 3 else "failed"
         raise RuntimeError(
-            f"Crawl failed for partition {context.partition_key} "
-            f"(exit code {completed.returncode})"
+            f"Crawl {label} for partition {context.partition_key} "
+            f"(exit code {completed.returncode}); see the run_summary log line "
+            "for the per-partition reconciliation."
         )
 
     return {"partition": context.partition_key, "run_id": run_id}
@@ -137,10 +144,12 @@ def curated_decisions(context: AssetExecutionContext) -> dict:
     context.log.info("Transform summary: %s", summary)
 
     if summary["failed"]:
-        context.log.warning(
-            "%s record(s) failed to transform in partition %s",
-            summary["failed"],
-            context.partition_key,
+        # A partially-transformed month must not present as a healthy asset:
+        # every failure is already logged per-record, so fail the
+        # materialization and let a retry (or a fix) produce a complete one.
+        raise RuntimeError(
+            f"{summary['failed']} record(s) failed to transform in partition "
+            f"{context.partition_key}; see transform_record_failed log lines."
         )
     return summary
 
@@ -153,15 +162,27 @@ ingest_and_transform = define_asset_job(
     description="Ingest a month of decisions, then curate it.",
 )
 
-# Decisions are published continuously, so we re-run the current month nightly
+
+# Decisions are published continuously, so we re-run the CURRENT month nightly
 # rather than assuming a month is final the moment it ends. Idempotency is what
 # makes that safe: a nightly re-run of an unchanged month writes nothing.
-daily_refresh = ScheduleDefinition(
+# The job is partitioned, so the schedule must name a partition explicitly --
+# a bare ScheduleDefinition would emit a RunRequest with no partition_key and
+# could not target the current month (caught in review; pinned by a test).
+@schedule(
     name="daily_current_month_refresh",
     job=ingest_and_transform,
     cron_schedule="0 2 * * *",
     execution_timezone="Europe/Dublin",
 )
+def daily_refresh(context: ScheduleEvaluationContext) -> RunRequest:
+    """Materialize the month the scheduled tick falls in."""
+    today = context.scheduled_execution_time.date()
+    partition_key = today.replace(day=1).isoformat()
+    return RunRequest(
+        run_key=f"refresh-{partition_key}-{today.isoformat()}",
+        partition_key=partition_key,
+    )
 
 defs = Definitions(
     assets=[landing_decisions, curated_decisions],

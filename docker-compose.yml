@@ -67,6 +67,13 @@ services:
         condition: service_healthy
       minio:
         condition: service_healthy
+    # Every setting from .env reaches the app container, so a customised
+    # bucket name, collection, body list or throttle applies consistently to
+    # BOTH the infrastructure containers and the pipeline itself. The
+    # `environment` block then overrides only what genuinely differs inside
+    # the compose network: service hostnames instead of localhost.
+    env_file:
+      - .env
     environment:
       MONGO_URI: mongodb://${MONGO_ROOT_USER:-root}:${MONGO_ROOT_PASSWORD:-example}@mongo:27017
       S3_ENDPOINT_URL: http://minio:9000

@@ -16,14 +16,14 @@ point-lookup-by-identifier and range-scan-by-partition, both of which are index
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from datetime import UTC, date, datetime
 from typing import Any
 
 from pymongo import ASCENDING, MongoClient, UpdateOne
 from pymongo.collection import Collection
 from pymongo.database import Database
-from pymongo.errors import BulkWriteError
+from pymongo.errors import BulkWriteError, DuplicateKeyError
 
 from ..config import MongoSettings
 from ..logging_setup import get_logger
@@ -69,18 +69,27 @@ class MetadataStore:
     def ensure_indexes(self) -> None:
         """Create the indexes the pipeline depends on. Safe to re-run.
 
-        The unique compound index on ``(identifier, body)`` is what makes
-        idempotency a *database guarantee* rather than an application
-        convention: even if two workers race on the same partition, the second
-        write becomes an update, not a duplicate row.
+        The landing zone is append-only and *versioned*: one row per distinct
+        content version of a record. The unique compound index on
+        ``(source, identifier, body, file_hash)`` is what makes that a
+        database guarantee -- an unchanged re-run cannot insert a duplicate
+        version even if two workers race, while changed content inserts a new
+        version row rather than mutating the old one.
         """
         self.landing.create_index(
-            [("identifier", ASCENDING), ("body", ASCENDING)],
+            [
+                ("source", ASCENDING),
+                ("identifier", ASCENDING),
+                ("body", ASCENDING),
+                ("file_hash", ASCENDING),
+            ],
             unique=True,
-            name="uq_identifier_body",
+            name="uq_source_identifier_body_hash",
+        )
+        self.landing.create_index(
+            [("identifier", ASCENDING), ("body", ASCENDING)], name="ix_identifier_body"
         )
         self.landing.create_index([("partition_date", ASCENDING)], name="ix_partition_date")
-        self.landing.create_index([("file_hash", ASCENDING)], name="ix_file_hash")
         self.landing.create_index([("run_id", ASCENDING)], name="ix_run_id")
 
         self.curated.create_index(
@@ -131,11 +140,17 @@ class MetadataStore:
         if bodies:
             query["body"] = {"$in": list(bodies)}
 
-        projection = {"identifier": 1, "body": 1, "file_hash": 1, "_id": 0}
-        index = {
-            (doc["identifier"], doc["body"]): doc.get("file_hash")
-            for doc in self.landing.find(query, projection)
-        }
+        projection = {"identifier": 1, "body": 1, "file_hash": 1, "first_seen_at": 1}
+        # Versions are append-only, so a record may have several rows; the
+        # idempotency answer is the LATEST version's hash per (identifier, body).
+        index: dict[tuple[str, str], str | None] = {}
+        order: dict[tuple[str, str], tuple[Any, str]] = {}
+        for doc in self.landing.find(query, projection):
+            key = (doc["identifier"], doc["body"])
+            rank = _version_order(doc)
+            if key not in index or rank > order[key]:
+                index[key] = doc.get("file_hash")
+                order[key] = rank
         logger.info(
             "Loaded idempotency index",
             extra={"event": "idempotency_index_loaded", "known_records": len(index)},
@@ -143,45 +158,66 @@ class MetadataStore:
         return index
 
     # ------------------------------------------------------------------ writes
-    def upsert_landing(self, record: DecisionRecord) -> str:
-        """Insert or update one landing record. Returns 'new' | 'updated' | 'unchanged'.
+    def record_version(self, record: DecisionRecord) -> str:
+        """Land one content version. Returns 'new' | 'updated' | 'unchanged'.
 
-        Note the split between ``$set`` and ``$setOnInsert``: ``first_seen_at``
-        must survive re-runs, so it is only written on insert. This is what
-        lets us answer "when did this document first appear in our system?"
-        even after fifty subsequent runs have touched the row.
+        The landing zone is append-only: existing rows are never mutated.
+        - No prior version of (identifier, body): INSERT -> 'new'.
+        - A prior version with this exact hash: touch its audit trail only
+          (last_seen_at / last_seen_run_id) -> 'unchanged'.
+        - Prior versions exist but this hash is new (an amended decision):
+          INSERT a fresh version row -> 'updated'. The old row, its object and
+          its hash all remain untouched, which is what gives us free amendment
+          history and an auditable past.
         """
-        payload = to_bson_safe(record.model_dump(mode="python"))
-        first_seen = payload.pop("first_seen_at")
-
-        existing = self.landing.find_one(
-            {"identifier": record.identifier, "body": record.body},
-            {"file_hash": 1, "_id": 0},
+        existing_same_hash = self.landing.find_one(
+            {
+                "source": record.source,
+                "identifier": record.identifier,
+                "body": record.body,
+                "file_hash": record.file_hash,
+            },
+            {"_id": 1},
         )
+        if existing_same_hash is not None:
+            self.landing.update_one(
+                {"_id": existing_same_hash["_id"]},
+                {"$set": {"last_seen_at": datetime.now(UTC), "last_seen_run_id": record.run_id}},
+            )
+            return "unchanged"
 
-        if existing is None:
-            outcome = "new"
-        elif existing.get("file_hash") == record.file_hash:
-            outcome = "unchanged"
-        else:
-            outcome = "updated"
+        any_prior = self.landing.find_one(
+            {"source": record.source, "identifier": record.identifier, "body": record.body},
+            {"_id": 1},
+        )
+        payload = to_bson_safe(record.model_dump(mode="python"))
+        if any_prior is not None:
             payload["content_changed_at"] = datetime.now(UTC)
 
-        self.landing.update_one(
-            {"identifier": record.identifier, "body": record.body},
-            {"$set": payload, "$setOnInsert": {"first_seen_at": first_seen}},
-            upsert=True,
-        )
-        return outcome
+        try:
+            self.landing.insert_one(payload)
+        except DuplicateKeyError:
+            # A racing worker landed the identical version between our check
+            # and the insert; the unique index kept the zone duplicate-free.
+            return "unchanged"
+        return "updated" if any_prior is not None else "new"
 
     def touch_last_seen(self, identifier: str, body: str, run_id: str) -> None:
-        """Mark an unchanged record as seen in this run without rewriting it.
+        """Mark a known record as seen in this run without rewriting it.
 
         Landing-zone data is immutable, so we never touch the content fields --
-        only the audit trail that proves the record still exists upstream.
+        only the audit trail (last_seen_at / last_seen_run_id) that proves the
+        record still exists upstream. Touches the latest version row.
         """
-        self.landing.update_one(
+        latest = self.landing.find_one(
             {"identifier": identifier, "body": body},
+            {"_id": 1, "first_seen_at": 1},
+            sort=[("first_seen_at", -1)],
+        )
+        if latest is None:
+            return
+        self.landing.update_one(
+            {"_id": latest["_id"]},
             {"$set": {"last_seen_at": datetime.now(UTC), "last_seen_run_id": run_id}},
         )
 
@@ -213,12 +249,72 @@ class MetadataStore:
         self.failures.insert_one(to_bson_safe(failure.model_dump(mode="python")))
 
     # ------------------------------------------------------------------ reads
-    def fetch_landing_between(self, start: date, end: date) -> list[dict[str, Any]]:
-        """Records whose partition falls in ``[start, end]`` -- transform input."""
-        cursor = self.landing.find(
-            {"partition_date": {"$gte": _as_dt(start), "$lte": _as_dt(end)}}
-        ).sort("identifier", ASCENDING)
-        return list(cursor)
+    def iter_latest_landing(
+        self, start: date, end: date, batch_size: int = 200
+    ) -> Iterator[dict[str, Any]]:
+        """Stream the LATEST version of each record in ``[start, end]``.
+
+        Two passes, both bounded: a projection-only scan resolves which
+        version row is current per (identifier, body) -- a few dozen bytes per
+        record -- then full documents stream in ``batch_size`` chunks by _id.
+        The transform therefore never holds the whole result set in memory,
+        which is what keeps it viable at 1000x the assessment's volume.
+        """
+        window = {"partition_date": {"$gte": _as_dt(start), "$lte": _as_dt(end)}}
+        latest: dict[tuple[str, str], tuple[Any, tuple[Any, str]]] = {}  # key -> (_id, rank)
+        projection = {"identifier": 1, "body": 1, "first_seen_at": 1}
+        for doc in self.landing.find(window, projection):
+            key = (doc["identifier"], doc["body"])
+            rank = _version_order(doc)
+            current = latest.get(key)
+            if current is None or rank > current[1]:
+                latest[key] = (doc["_id"], rank)
+
+        ids = sorted((v[0] for v in latest.values()), key=str)
+        for offset in range(0, len(ids), batch_size):
+            chunk = ids[offset : offset + batch_size]
+            yield from self.landing.find({"_id": {"$in": chunk}}).sort(
+                "identifier", ASCENDING
+            )
+
+    def load_curated_hashes(
+        self, start: date, end: date
+    ) -> dict[tuple[str, str], str | None]:
+        """``{(identifier, body): file_hash}`` for curated records in the window.
+
+        Lets the transform verify metadata currency separately from object
+        currency -- an existing curated object must never mask an absent or
+        stale curated metadata row.
+        """
+        window = {"partition_date": {"$gte": _as_dt(start), "$lte": _as_dt(end)}}
+        projection = {"identifier": 1, "body": 1, "file_hash": 1, "_id": 0}
+        return {
+            (doc["identifier"], doc["body"]): doc.get("file_hash")
+            for doc in self.curated.find(window, projection)
+        }
+
+    def count_latest_landing(self, start: date, end: date) -> int:
+        """How many distinct records (not versions) fall in the window."""
+        window = {"partition_date": {"$gte": _as_dt(start), "$lte": _as_dt(end)}}
+        keys = {
+            (doc["identifier"], doc["body"])
+            for doc in self.landing.find(window, {"identifier": 1, "body": 1})
+        }
+        return len(keys)
+
+
+_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
+
+
+def _version_order(doc: dict[str, Any]) -> tuple[str, str]:
+    """Sort rank for version rows: newest ``first_seen_at`` wins, with the
+    monotonic ObjectId as tiebreaker (BSON datetimes have only millisecond
+    precision, so two versions landed in the same millisecond would otherwise
+    tie and resolve arbitrarily). Timestamps compare as ISO strings so naive
+    and aware values from different drivers can never raise on comparison.
+    """
+    stamp = doc.get("first_seen_at") or _EPOCH
+    return (stamp.isoformat(), str(doc.get("_id", "")))
 
 
 def _as_dt(value: date) -> datetime:

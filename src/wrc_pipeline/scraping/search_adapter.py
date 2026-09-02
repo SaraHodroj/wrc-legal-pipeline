@@ -316,6 +316,26 @@ class WrcSearchAdapter:
         return None
 
 
+#: Source registry: adding a legal source means implementing the
+#: ``SearchAdapter`` protocol, registering the class here, and selecting it
+#: via ``SCRAPE_SOURCE``. Nothing else in the pipeline changes.
+SOURCE_ADAPTERS: dict[str, type[WrcSearchAdapter]] = {
+    "wrc": WrcSearchAdapter,
+}
+
+
+def get_adapter(source: str, base_url: str) -> WrcSearchAdapter:
+    """Instantiate the registered adapter for ``source``."""
+    try:
+        adapter_cls = SOURCE_ADAPTERS[source]
+    except KeyError:
+        raise ValueError(
+            f"No adapter registered for source {source!r}; "
+            f"registered: {sorted(SOURCE_ADAPTERS)}"
+        ) from None
+    return adapter_cls(base_url=base_url)
+
+
 def iter_pages(max_pages: int = 500) -> Iterator[int]:
     """Bounded page counter.
 

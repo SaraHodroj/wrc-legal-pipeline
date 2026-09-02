@@ -89,6 +89,20 @@ def main(argv: list[str] | None = None) -> int:
             },
         )
         return 1
+
+    # The exit code reflects the reconciliation ledger, not vibes:
+    #   0 -- every (body, partition) is COMPLETE;
+    #   1 -- at least one partition FAILED outright (search never returned, or
+    #        the source reported records we discovered none of) -- retryable;
+    #   3 -- PARTIAL: some records failed and each one is logged/attributed
+    #        (the brief's "N-X with X logged" case), distinct from success so
+    #        an orchestrator or operator can decide to replay.
+    run_stats = getattr(crawler.spider, "stats_model", None)
+    status = run_stats.run_status if run_stats is not None else "failed"
+    if status == "failed":
+        return 1
+    if status == "partial":
+        return 3
     return 0
 
 
