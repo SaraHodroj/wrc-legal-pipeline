@@ -146,9 +146,11 @@ class MetadataStore:
         Instead we pay for one indexed range query up front and keep the answer
         in a dict. Lookups during the crawl are then O(1) and non-blocking.
 
-        The trade-off is memory: roughly 100 bytes per record, so ~100 MB at
-        one million records. That is fine at the assessment's scale and for a
-        good way beyond it; see ARCHITECTURE.md for what changes at 1000x.
+        The trade-off is memory: one dict entry per record -- a few hundred
+        bytes each with Python overhead, so on the order of hundreds of MB at
+        a million records. Fine at the assessment's scale and beyond; see
+        ARCHITECTURE.md for what changes at 1000x (Redis / server-side
+        aggregation).
         """
         query: dict[str, Any] = {"partition_date": {"$gte": _as_dt(start), "$lte": _as_dt(end)}}
         if bodies:
@@ -271,11 +273,13 @@ class MetadataStore:
     ) -> Iterator[dict[str, Any]]:
         """Stream the LATEST version of each record in ``[start, end]``.
 
-        Two passes, both bounded: a projection-only scan resolves which
-        version row is current per (identifier, body) -- a few dozen bytes per
-        record -- then full documents stream in ``batch_size`` chunks by _id.
-        The transform therefore never holds the whole result set in memory,
-        which is what keeps it viable at 1000x the assessment's volume.
+        Document PAYLOADS are bounded: full documents stream in ``batch_size``
+        chunks by _id, so the heavy bytes never accumulate. The preceding
+        version-resolution pass, however, is honestly O(N) in record COUNT --
+        it holds one dict entry (a few hundred bytes with Python overhead) per
+        record in the window. Fine for this assessment's scale and well
+        beyond; at tens of millions of records per window it should move to a
+        server-side aggregation ($sort + $group), per ARCHITECTURE.md.
         """
         window = {"partition_date": {"$gte": _as_dt(start), "$lte": _as_dt(end)}}
         latest: dict[tuple[str, str], tuple[Any, tuple[Any, str]]] = {}  # key -> (_id, rank)

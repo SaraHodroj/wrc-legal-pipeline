@@ -53,7 +53,7 @@ would need a pass over the remaining `(identifier, body)` lookups. Beyond
 that: config becomes a declarative per-source registry the orchestrator
 generates assets from; per-source concurrency limits and failure budgets; the
 idempotency index moves to Redis and latest-version selection to server-side
-aggregation (~100 bytes/record in memory is fine to tens of millions, not
-beyond); golden extraction fixtures per source so a redesign fails a test
+aggregation (both are O(N) dicts today -- a few hundred bytes per record,
+fine to the low millions, not beyond); golden extraction fixtures per source so a redesign fails a test
 ("records per partition dropped >N%" is the highest-value alert); PDF
 text/OCR becomes its own stage.
