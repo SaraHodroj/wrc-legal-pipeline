@@ -69,7 +69,16 @@ def extract_main_content(html: str, *, min_length: int = MIN_CONTENT_LENGTH) -> 
         for element in soup.find_all(tag_name):
             element.decompose()
 
+    # NB: find_all() materialises its result list up front, but decompose()
+    # destroys the element AND all its descendants (BeautifulSoup >= 4.13
+    # clears their attribute dicts entirely). Descendants of a decomposed
+    # chrome element therefore still appear later in this loop as husks whose
+    # ``attrs`` is gone -- touching them raised AttributeError on every real
+    # page (caught in a live transform run over 893 documents; the offline
+    # fixtures had no nested tags inside chrome elements). Skip them.
     for element in soup.find_all(True):
+        if getattr(element, "decomposed", False):
+            continue
         if _is_chrome(element):
             element.decompose()
 
@@ -100,13 +109,16 @@ def extract_plain_text(html: str) -> str:
 
 # ------------------------------------------------------------------ internals
 def _is_chrome(element: Tag) -> bool:
-    raw_classes = element.get("class")
+    # A decomposed element's ``attrs`` can be None (bs4 >= 4.13 destroys it);
+    # read defensively so a husk can never crash the extraction.
+    attrs = getattr(element, "attrs", None) or {}
+    raw_classes = attrs.get("class")
     classes: list[str] = []
     if isinstance(raw_classes, str):  # bs4 may return a bare string for some attrs
         classes = [raw_classes]
     elif raw_classes:
         classes = [str(c) for c in raw_classes]
-    element_id = element.get("id")
+    element_id = attrs.get("id")
     parts = [*classes, element_id if isinstance(element_id, str) else ""]
     identifiers = " ".join(part for part in parts if part).lower()
     if not identifiers:

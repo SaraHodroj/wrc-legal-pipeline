@@ -35,7 +35,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Protocol
-from urllib.parse import urljoin
+from urllib.parse import unquote, urljoin
 
 from parsel import Selector
 
@@ -278,8 +278,10 @@ class WrcSearchAdapter:
         match = REF_NO_RE.search(block_text)
         if match:
             return match.group(1).strip()
-        # Fallback: the URL slug is the identifier in lowercase.
-        slug = href.rstrip("/").rsplit("/", 1)[-1]
+        # Fallback: the URL slug is the identifier in lowercase. Unquote it --
+        # a handful of live slugs are percent-encoded (e.g. an en dash as
+        # %E2%80%93), which would otherwise leak into the identifier.
+        slug = unquote(href.rstrip("/").rsplit("/", 1)[-1])
         slug = slug.split("?")[0]
         if slug.endswith(".html"):
             slug = slug[: -len(".html")]

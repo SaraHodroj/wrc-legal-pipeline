@@ -85,8 +85,12 @@ class DecisionRecord(BaseModel):
 
         The listing page and the detail page format identifiers differently on
         this site; without normalisation the same decision would be stored
-        twice and idempotency would silently fail.
+        twice and idempotency would silently fail. A few live slugs also use
+        unicode dashes (en/em dash), which must collapse to the same record
+        as their ASCII-hyphen siblings.
         """
+        for dash in ("–", "—", "−"):  # en dash, em dash, minus
+            value = value.replace(dash, "-")
         collapsed = "-".join(part.strip() for part in value.split("-"))
         return " ".join(collapsed.split()).upper()
 

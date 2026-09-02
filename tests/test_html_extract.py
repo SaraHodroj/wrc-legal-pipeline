@@ -55,3 +55,43 @@ def test_falls_back_when_no_known_container_matches():
 def test_plain_text_normalises_whitespace():
     text = extract_plain_text("<p>a   b\n\n\tc</p>")
     assert text == "a b c"
+
+
+def test_nested_tags_inside_chrome_do_not_crash_extraction():
+    """Live-run regression (893/893 records failed): BeautifulSoup >= 4.13's
+    decompose() destroys descendants' attribute dicts, and descendants of a
+    decomposed chrome element still appear later in the find_all sweep as
+    husks. Real pages always nest tags inside their cookie banner; the
+    original fixtures did not, so the suite never caught it."""
+    from wrc_pipeline.transform.html_extract import extract_main_content
+
+    body = "The adjudication officer finds the complaint well founded. " * 10
+    html = f"""
+    <html><body>
+      <div class="cookie-banner">
+        <p>We use <a href="/cookies">cookies</a> to <b>improve</b> things.</p>
+        <span id="cookie-accept"><button>Accept</button></span>
+      </div>
+      <main id="main"><h1>ADJ-00000001</h1><p>{body}</p></main>
+    </body></html>
+    """
+    result = extract_main_content(html)
+    assert "well founded" in result
+    assert "cookie" not in result.lower()
+
+
+def test_identifier_normalisation_collapses_unicode_dashes():
+    """Live-run regression: one slug used a percent-encoded en dash, producing
+    the identifier 'IR-SC – 00001494' alongside its ASCII sibling."""
+    from datetime import date
+
+    from wrc_pipeline.models import DecisionRecord
+
+    record = DecisionRecord(
+        identifier="IR-SC – 00001494",
+        body="Workplace Relations Commission",
+        source_url="https://example.ie/x",
+        partition_date=date(2024, 3, 1),
+        run_id="t",
+    )
+    assert record.identifier == "IR-SC-00001494"
