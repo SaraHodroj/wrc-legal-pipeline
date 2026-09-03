@@ -127,7 +127,8 @@ ingest_and_transform = define_asset_job(
 )
 
 
-# Decisions are published continuously, so we re-run the CURRENT month nightly rather than assuming a month is final the moment it ends. Idempotency is what makes that safe: a nightly re-run of an unchanged month writes nothing.
+# Decisions are published continuously, so we re-run the CURRENT month nightly rather than assuming a month is final the moment it ends. 
+#Idempotency is what makes that safe: a nightly re-run of an unchanged month writes nothing.
 # The job is partitioned, so the schedule must name a partition explicitly
 @schedule(
     name="daily_current_month_refresh",
