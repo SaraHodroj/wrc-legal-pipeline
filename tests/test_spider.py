@@ -231,16 +231,6 @@ def test_run_summary_reconciles_found_vs_scraped(spider):
     assert summary["success_rate"] == 0.985
 
 
-# --------------------------------------------------------------------------
-# Crawl entry points.
-#
-# Scrapy 2.13 replaced the synchronous ``start_requests()`` entry point with
-# the asynchronous ``start()``, and recent releases no longer call
-# ``start_requests()`` at all. A spider defining only the legacy method
-# "finishes" in milliseconds with zero requests and **no error** -- the
-# nastiest possible failure mode for a scheduled pipeline. These tests pin
-# both entry points so neither can silently rot.
-# --------------------------------------------------------------------------
 def test_start_requests_fans_out_one_search_request_per_body_partition(spider):
     requests = list(spider.start_requests())
 
@@ -263,9 +253,6 @@ def test_async_start_yields_the_same_requests_as_start_requests(spider):
     assert [r.url for r in requests] == [r.url for r in spider.start_requests()]
 
 
-# --------------------------------------------------------------------------
-# Regressions caught by the first live run against workplacerelations.ie.
-# --------------------------------------------------------------------------
 DETAIL_WITH_COOKIE_BANNER = """
 <html><body>
   <div class="consent">
@@ -281,9 +268,6 @@ DETAIL_WITH_COOKIE_BANNER = """
 
 
 def test_cookie_policy_pdf_is_not_mistaken_for_the_decision(spider):
-    """Live-run regression: every WRC detail page links cookie_policy.pdf from
-    its consent banner; a naive first-PDF-link selector sent every record
-    there (a 404) and the smoke test stored nothing."""
     resp = response(
         "https://example.ie/en/cases/2025/july/adj-00054658.html", DETAIL_WITH_COOKIE_BANNER
     )
@@ -322,10 +306,6 @@ PAGE_ONE_OF_MANY = """
 
 
 def test_pagination_falls_back_to_a_constructed_url(spider):
-    """Live-run regression: the site reported 234 results but rendered no
-    next-page link our matcher recognised, so the crawl silently stopped at
-    page 1. When the counter says more records exist, the spider must
-    construct the next page's URL itself."""
     resp = response("https://example.ie/en/search/?decisions=1", PAGE_ONE_OF_MANY)
     requests = list(spider.parse_search(resp, "Workplace Relations Commission", PARTITION, 1))
 
@@ -335,9 +315,6 @@ def test_pagination_falls_back_to_a_constructed_url(spider):
 
 
 def test_constructed_pagination_stops_when_a_page_repeats(spider):
-    """The safety net for the fallback: if page 2 re-serves page 1's rows
-    (i.e. our page parameter guess was wrong), pagination must stop instead
-    of looping to page 500."""
     resp1 = response("https://example.ie/en/search/?decisions=1", PAGE_ONE_OF_MANY)
     list(spider.parse_search(resp1, "Workplace Relations Commission", PARTITION, 1))
 
@@ -347,7 +324,6 @@ def test_constructed_pagination_stops_when_a_page_repeats(spider):
 
 
 def test_relative_next_page_hrefs_are_recognised(spider):
-    """A pager that emits `?page=2` (no path) must still be followed."""
     paged = PAGE_ONE_OF_MANY.replace(
         "</body>", '<a href="?decisions=1&amp;page=2">2</a></body>'
     )
@@ -358,8 +334,6 @@ def test_relative_next_page_hrefs_are_recognised(spider):
 
 
 def test_blank_row_description_is_backfilled_from_the_detail_page(spider):
-    """Live-run regression: listing rows sometimes carry no description; the
-    detail page's meta description reliably holds the parties ('A v B')."""
     from dataclasses import replace
 
     page = DETAIL_SELF_CONTAINED.replace(
@@ -378,9 +352,7 @@ def test_blank_row_description_is_backfilled_from_the_detail_page(spider):
     assert stores[0]["record"].description == "Declan Holden V Ger Brennan Construction"
 
 
-# --------------------------------------------------------------------------
-# Review regressions: network-level idempotency and honest reconciliation.
-# --------------------------------------------------------------------------
+
 def test_known_records_are_skipped_before_any_download(spider):
     """"Running it twice must not re-download unchanged files": a record whose
     (identifier, body) is already landed is skipped at LISTING time -- no
@@ -434,8 +406,6 @@ def test_failed_search_marks_partition_failed_not_green():
 
 
 def test_success_rate_is_zero_when_nothing_found_but_requests_failed():
-    """The old metric reported 100% success for a run in which every search
-    request failed; an empty-but-failing run must be 0.0."""
     from wrc_pipeline.models import RunStats
 
     stats = RunStats(run_id="t")
@@ -459,9 +429,6 @@ def test_partial_status_when_some_records_fail():
 
 
 def test_listing_gap_makes_partition_partial_never_complete():
-    """Round-2 review regression, exact scenario: source says 10, we only
-    discovered 9, all 9 succeeded. That is NOT complete -- one record fell
-    through listing parsing/pagination and must surface."""
     from wrc_pipeline.models import RunStats
 
     stats = RunStats(run_id="t")
