@@ -47,8 +47,7 @@ missing records can never report green.
 
 Site-specific logic lives behind one `SearchAdapter` protocol with a source
 registry (`SOURCE_ADAPTERS`), and `source` is part of the landing/curated
-natural keys — honestly, groundwork rather than a finished platform: curated
-object names are flat `identifier.ext` per the brief, and a second source
+natural keys: curated, object names are flat `identifier.ext` per the brief, and a second source
 would need a pass over the remaining `(identifier, body)` lookups. Beyond
 that: config becomes a declarative per-source registry the orchestrator
 generates assets from; per-source concurrency limits and failure budgets; the
