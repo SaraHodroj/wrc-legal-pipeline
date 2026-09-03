@@ -73,10 +73,7 @@ def transform_window(start: date, end: date, run_id: str | None = None) -> dict[
     batch: list[dict[str, Any]] = []
     curated_index = metadata.load_curated_hashes(start, end)
 
-    # Streamed, not materialised: documents arrive from Mongo in bounded
-    # batches (latest version per record only) and curated rows are flushed in
-    # bounded batches -- memory stays flat whether the window holds 900
-    # documents or 900,000.
+
     for doc in metadata.iter_latest_landing(start, end, batch_size=batch_size):
         identifier = doc.get("identifier", "<unknown>")
         try:
@@ -139,10 +136,6 @@ def _transform_one(
     identifier = doc["identifier"]
 
     if doc_type in PASSTHROUGH_TYPES:
-        # Binary formats are stored as-is, per the brief. Extracting text from
-        # a PDF is a genuinely different problem (layout analysis, OCR for
-        # scanned decisions) and belongs in its own stage with its own failure
-        # modes -- folding it in here would make this step unreliable.
         new_payload = payload
         new_hash = doc.get("file_hash") or hash_bytes(payload)
         text_length = None
@@ -155,27 +148,6 @@ def _transform_one(
         text_length = len(extract_plain_text(cleaned))
 
     extension = doc_type if doc_type != DocumentType.UNKNOWN.value else "bin"
-    # The brief is explicit: "Change the name of ALL the files to become
-    # identifier.ext". Curated keys are therefore flat at the bucket root, not
-    # nested under a body folder the way landing-zone keys are -- landing
-    # organises for browsability during ingestion; curated is the literal,
-    # renamed deliverable the brief asks for.
-    #
-    # Collision note: this assumes identifiers are unique across bodies. On
-    # this source that holds in practice -- each body's decisions carry a
-    # distinct prefix (ADJ-, DEC-E, EDA, LCR, ...) -- but it is an assumption
-    # worth stating rather than leaving implicit. If a future source's IDs
-    # were not globally unique, the fix is a compound key in Mongo
-    # (identifier, body) -- already how landing_decisions is indexed -- with
-    # the object key gaining a short body prefix only if a real collision
-    # were observed, not pre-emptively.
-    new_key = f"{identifier}.{extension}"
-
-    # Idempotency, by hash -- but object idempotency and METADATA idempotency
-    # are separate questions. An existing, identical curated object only lets
-    # us skip the PUT; the metadata row is still emitted and upserted, so a
-    # run that crashed between "object uploaded" and "Mongo written" repairs
-    # itself on the next pass instead of leaving a permanent gap.
     curated_bucket = settings.object_store.curated_bucket
     object_current = False
     if objects.exists(curated_bucket, new_key):
