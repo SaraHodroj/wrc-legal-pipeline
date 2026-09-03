@@ -148,6 +148,8 @@ def _transform_one(
         text_length = len(extract_plain_text(cleaned))
 
     extension = doc_type if doc_type != DocumentType.UNKNOWN.value else "bin"
+    new_key = f"{identifier}.{extension}"
+    
     curated_bucket = settings.object_store.curated_bucket
     object_current = False
     if objects.exists(curated_bucket, new_key):
